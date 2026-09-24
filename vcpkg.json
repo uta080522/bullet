@@ -1,6 +1,6 @@
 {
   "name": "bullet",
-  "version-string": "0.0.0",
+  "version-string": "0.1.0",
   "builtin-baseline": "48483a35f9e6f32572bc7c9382f14436cc7106a8",
   "dependencies": [
     { "name": "cjson", "default-features": false },

@@ -66,18 +66,36 @@ typedef struct {
 	int x, width;
 } Part;
 
+/* Static sprites own either a dense surface or nontransparent RGBA runs. */
+typedef struct {
+	SDL_Surface *pixels;
+	unsigned char *runs;
+	size_t bytes;
+} Sprite;
+
+typedef struct {
+	int x, y, width;
+} Run;
+
 typedef struct {
 	int64_t time, stamp;
 	Part *parts;
 	size_t count, order, next;
 	int width, y;
-	SDL_Surface *sprite;
+	Sprite *sprite;
 } Message;
 
 typedef struct {
 	int width, height, fps_num, fps_den;
 	int64_t duration;
 } Video;
+
+/* Half-open interval of CFR frames and the occupied vertical RGBA band. */
+typedef struct {
+	int y, height;
+	int64_t first, end;
+	size_t visible;
+} Overlay;
 
 typedef struct {
 	const char *video, *chat, *output, *font, *dir, *url;
@@ -98,6 +116,9 @@ static char *inferred_chat, *inferred_output;
 static int keep_log;
 static const char *chat_context;
 static int font_size, outline, gap, lane_height, emote_height;
+#ifdef BULLET_TEST
+static int dense_reference;
+#endif
 
 static SDL_NORETURN void
 die(const char *fmt, ...)
@@ -305,22 +326,108 @@ surface_free(SDL_Surface *s)
 	}
 }
 
+static void
+surface_limit(int width, int height)
+{
+	if (width < 1 || height < 1 || width > 65536 || height > 16000 ||
+	    (int64_t)width * height > MAX_PIXELS)
+		die("image dimensions exceed limit: %dx%d", width, height);
+	if ((size_t)width * height * 4 > MAX_MEMORY - surface_bytes)
+		die("decoded image memory exceeds 512 MiB");
+}
+
 static SDL_Surface *
 surface(int width, int height)
 {
 	SDL_Surface *s;
-	size_t bytes;
 
-	if (width < 1 || height < 1 || width > 65536 || height > 16000 ||
-	    (int64_t)width * height > MAX_PIXELS)
-		die("image dimensions exceed limit: %dx%d", width, height);
-	bytes = (size_t)width * height * 4;
-	if (bytes > MAX_MEMORY - surface_bytes)
-		die("decoded image memory exceeds 512 MiB");
+	surface_limit(width, height);
 	s = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
 	check(s != NULL, "create RGBA surface");
 	surface_bytes += (size_t)s->pitch * s->h;
 	return s;
+}
+
+/* A NULL destination measures the packed size without allocating. */
+static size_t
+pack_runs(const SDL_Surface *s, unsigned char *data, size_t limit)
+{
+	const unsigned char *row;
+	Run run;
+	size_t size, bytes;
+	int x, y;
+
+	size = 0;
+	for (y = 0; y < s->h; y++) {
+		row = (const unsigned char *)s->pixels + y * s->pitch;
+		for (x = 0; x < s->w;) {
+			while (x < s->w && !row[x * 4 + 3])
+				x++;
+			run.x = x;
+			while (x < s->w && row[x * 4 + 3])
+				x++;
+			if (x == run.x)
+				continue;
+			run.y = y;
+			run.width = x - run.x;
+			bytes = sizeof run + (size_t)run.width * 4;
+			if (bytes > limit - size)
+				return NONE;
+			if (data) {
+				memcpy(data + size, &run, sizeof run);
+				memcpy(data + size + sizeof run,
+				       row + run.x * 4, (size_t)run.width * 4);
+			}
+			size += bytes;
+		}
+	}
+	return size;
+}
+
+/* Takes ownership. Keep dense pixels if packing cannot save memory or if
+ * the temporary allocation would exceed the existing image budget. */
+static Sprite *
+sprite_create(SDL_Surface *pixels)
+{
+	Sprite *s;
+	size_t limit, bytes;
+
+	s = resize(NULL, 1, sizeof *s);
+	memset(s, 0, sizeof *s);
+	s->pixels = pixels;
+#ifdef BULLET_TEST
+	if (dense_reference)
+		return s;
+#endif
+	limit = (size_t)pixels->pitch * pixels->h - 1;
+	if (limit > MAX_MEMORY - surface_bytes)
+		limit = MAX_MEMORY - surface_bytes;
+	bytes = pack_runs(pixels, NULL, limit);
+	if (bytes == NONE)
+		return s;
+	if (bytes) {
+		s->runs = malloc(bytes);
+		if (!s->runs)
+			return s;
+		if (pack_runs(pixels, s->runs, bytes) != bytes)
+			die("sprite run sizes disagree");
+	}
+	s->bytes = bytes;
+	surface_bytes += bytes;
+	surface_free(pixels);
+	s->pixels = NULL;
+	return s;
+}
+
+static void
+sprite_free(Sprite *s)
+{
+	if (s) {
+		surface_free(s->pixels);
+		surface_bytes -= s->bytes;
+		free(s->runs);
+		free(s);
+	}
 }
 
 static void
@@ -332,7 +439,7 @@ freechat(void)
 		for (j = 0; j < messages[i].count; j++)
 			free(messages[i].parts[j].text);
 		free(messages[i].parts);
-		surface_free(messages[i].sprite);
+		sprite_free(messages[i].sprite);
 	}
 	for (i = 0; i < nassets; i++) {
 		free(assets[i].url);
@@ -727,6 +834,23 @@ frame_time(int64_t frame, int num, int den)
 	if (ticks / num > INT64_MAX / SECOND - 1)
 		die("frame time overflow");
 	return (ticks / num) * SECOND + (ticks % num) * SECOND / num;
+}
+
+/* First frame whose integer microsecond clock reaches time. Split the
+ * product so large, valid rational frame rates do not overflow. */
+static int64_t
+frame_ceiling(int64_t time, int num, int den)
+{
+	int64_t ticks, rest, divisor;
+
+	if (time <= 0)
+		return 0;
+	if (time > MAX_TIME)
+		die("frame time exceeds limit");
+	ticks = (time / SECOND) * num;
+	rest = (ticks % den) * SECOND + (time % SECOND) * num;
+	divisor = (int64_t)den * SECOND;
+	return ticks / den + rest / divisor + (rest % divisor != 0);
 }
 
 static cJSON *
@@ -1242,8 +1366,8 @@ fetch(const char *url, size_t *length)
 static void
 asset_frame(Asset *a, SDL_Surface *source, uint64_t delay_ms)
 {
-	SDL_Surface *rgba, *scaled, *out;
-	int width, row;
+	SDL_Surface *rgba, *out;
+	int width;
 	int64_t end;
 
 	if (a->count == MAX_FRAMES || delay_ms > 86400000)
@@ -1251,18 +1375,18 @@ asset_frame(Asset *a, SDL_Surface *source, uint64_t delay_ms)
 	width = (int)round((double)emote_height * source->w / source->h);
 	if (width < 1)
 		width = 1;
-	out = surface(width, emote_height);
+	surface_limit(width, emote_height);
 	rgba = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
 	check(rgba != NULL, "convert emote pixels");
-	scaled =
-	    SDL_ScaleSurface(rgba, width, emote_height, SDL_SCALEMODE_LINEAR);
-	check(scaled != NULL, "resize emote");
-	for (row = 0; row < emote_height; row++)
-		memcpy((unsigned char *)out->pixels + row * out->pitch,
-		       (unsigned char *)scaled->pixels + row * scaled->pitch,
-		       (size_t)width * 4);
-	SDL_DestroySurface(scaled);
-	SDL_DestroySurface(rgba);
+	/* Own the resized pixels directly; no second surface and row copy. */
+	out = rgba;
+	if (rgba->w != width || rgba->h != emote_height) {
+		out = SDL_ScaleSurface(rgba, width, emote_height,
+				       SDL_SCALEMODE_LINEAR);
+		check(out != NULL, "resize emote");
+		SDL_DestroySurface(rgba);
+	}
+	surface_bytes += (size_t)out->pitch * out->h;
 	a->frames = resize(a->frames, a->count + 1, sizeof *a->frames);
 	a->ends = resize(a->ends, a->count + 1, sizeof *a->ends);
 	end = a->count ? a->ends[a->count - 1] : 0;
@@ -1353,47 +1477,103 @@ load_asset(Asset *a, const char *directory)
 static SDL_Surface *
 frame_at(const Asset *a, int64_t elapsed)
 {
-	size_t i;
+	size_t first, last, mid;
 	int64_t time;
 
 	time = elapsed % a->ends[a->count - 1];
-	for (i = 0; i + 1 < a->count && time >= a->ends[i]; i++)
-		;
-	return a->frames[i];
+	first = 0;
+	last = a->count - 1;
+	while (first < last) {
+		mid = first + (last - first) / 2;
+		if (time < a->ends[mid])
+			last = mid;
+		else
+			first = mid + 1;
+	}
+	return a->frames[first];
 }
 
 /* Straight-alpha source-over, including colour in translucent pixels. */
 static void
+paste_pixels(unsigned char *d, const unsigned char *s, int count)
+{
+	int i, c;
+	unsigned int sa, da, inv, out, value;
+
+	for (i = 0; i < count; i++, s += 4, d += 4) {
+		sa = s[3];
+		if (!sa)
+			continue;
+		da = d[3];
+		/* These cases are exactly a copy, including RGB under alpha.
+		 */
+		if (sa == 255 || !da) {
+			memcpy(d, s, 4);
+			continue;
+		}
+		inv = 255 - sa;
+		out = sa + (da * inv + 127) / 255;
+		for (c = 0; c < 3; c++) {
+			value = s[c] * sa * 255 + d[c] * da * inv;
+			value = (value + out * 255 / 2) / (out * 255);
+			d[c] = (unsigned char)(value > 255 ? 255 : value);
+		}
+		d[3] = (unsigned char)out;
+	}
+}
+
+static void
 paste(SDL_Surface *to, const SDL_Surface *from, int x, int y)
 {
-	int sx, sy, left, top, right, bottom, c;
+	int sy, left, top, right, bottom;
 	unsigned char *d;
 	const unsigned char *s;
-	unsigned int sa, da, inv, out, value;
 
 	left = x < 0 ? -x : 0;
 	top = y < 0 ? -y : 0;
 	right = from->w < to->w - x ? from->w : to->w - x;
 	bottom = from->h < to->h - y ? from->h : to->h - y;
+	if (left >= right)
+		return;
 	for (sy = top; sy < bottom; sy++) {
-		s = (const unsigned char *)from->pixels + sy * from->pitch;
-		d = (unsigned char *)to->pixels + (y + sy) * to->pitch;
-		for (sx = left; sx < right; sx++) {
-			sa = s[sx * 4 + 3];
-			if (!sa)
-				continue;
-			da = d[(x + sx) * 4 + 3];
-			inv = 255 - sa;
-			out = sa + (da * inv + 127) / 255;
-			for (c = 0; c < 3; c++) {
-				value = s[sx * 4 + c] * sa * 255 +
-					d[(x + sx) * 4 + c] * da * inv;
-				value = (value + out * 255 / 2) / (out * 255);
-				d[(x + sx) * 4 + c] =
-				    (unsigned char)(value > 255 ? 255 : value);
-			}
-			d[(x + sx) * 4 + 3] = (unsigned char)out;
-		}
+		s = (const unsigned char *)from->pixels + sy * from->pitch +
+		    left * 4;
+		d = (unsigned char *)to->pixels + (y + sy) * to->pitch +
+		    (x + left) * 4;
+		paste_pixels(d, s, right - left);
+	}
+}
+
+static void
+paste_sprite(SDL_Surface *to, const Sprite *s, int x, int y)
+{
+	Run run;
+	size_t offset;
+	int dx, dy, left, right;
+	unsigned char *d;
+	const unsigned char *pixels;
+
+	if (s->pixels) {
+		paste(to, s->pixels, x, y);
+		return;
+	}
+	for (offset = 0; offset < s->bytes;) {
+		memcpy(&run, s->runs + offset, sizeof run);
+		pixels = s->runs + offset + sizeof run;
+		offset += sizeof run + (size_t)run.width * 4;
+		dy = y + run.y;
+		if (dy < 0)
+			continue;
+		if (dy >= to->h)
+			break;
+		dx = x + run.x;
+		left = dx < 0 ? -dx : 0;
+		right = run.width < to->w - dx ? run.width : to->w - dx;
+		if (left >= right)
+			continue;
+		d = (unsigned char *)to->pixels + dy * to->pitch +
+		    (dx + left) * 4;
+		paste_pixels(d, pixels + left * 4, right - left);
 	}
 }
 
@@ -1529,18 +1709,18 @@ static void
 bake(Message *m)
 {
 	SDL_Color white = {255, 255, 255, 255}, black = {0, 0, 0, 255};
-	SDL_Surface *fill, *edge, *image;
+	SDL_Surface *fill, *edge, *image, *pixels;
 	Part *p;
 	size_t j;
 	int y, dx, dy;
 
-	m->sprite = surface(m->width + 2, lane_height);
+	pixels = surface(m->width + 2, lane_height);
 	for (j = 0; j < m->count; j++) {
 		p = &m->parts[j];
 		if (p->asset != NONE) {
 			if (assets[p->asset].count == 1) {
 				image = assets[p->asset].frames[0];
-				paste(m->sprite, image, p->x,
+				paste(pixels, image, p->x,
 				      (lane_height - image->h) / 2);
 			}
 			continue;
@@ -1551,23 +1731,24 @@ bake(Message *m)
 			edge = text_surface(p->text, black);
 			for (dy = -2; dy <= 2; dy += 4)
 				for (dx = -2; dx <= 2; dx += 4)
-					paste(m->sprite, edge,
+					paste(pixels, edge,
 					      p->x + outline + dx, y + dy);
 		} else {
 			check(TTF_SetFontOutline(font, outline),
 			      "set outline");
 			edge = text_surface(p->text, black);
 			check(TTF_SetFontOutline(font, 0), "reset outline");
-			paste(m->sprite, edge, p->x, y - outline);
+			paste(pixels, edge, p->x, y - outline);
 		}
-		paste(m->sprite, fill, p->x + outline, y);
+		paste(pixels, fill, p->x + outline, y);
 		SDL_DestroySurface(fill);
 		SDL_DestroySurface(edge);
 	}
+	m->sprite = sprite_create(pixels);
 }
 
 static void
-drawframe(int64_t now, size_t first, size_t last)
+drawframe(int64_t now, size_t first, size_t last, int top)
 {
 	Message *m;
 	Part *p;
@@ -1585,14 +1766,14 @@ drawframe(int64_t now, size_t first, size_t last)
 			continue;
 		if (!m->sprite)
 			bake(m);
-		paste(canvas, m->sprite, x, m->y);
+		paste_sprite(canvas, m->sprite, x, m->y - top);
 		for (j = 0; j < m->count; j++) {
 			p = &m->parts[j];
 			if (p->asset == NONE || assets[p->asset].count == 1)
 				continue;
 			image = frame_at(&assets[p->asset], now - m->time);
 			paste(canvas, image, x + p->x,
-			      m->y + (lane_height - image->h) / 2);
+			      m->y - top + (lane_height - image->h) / 2);
 		}
 	}
 	if (opt.opacity == 100)
@@ -1606,6 +1787,53 @@ drawframe(int64_t now, size_t first, size_t last)
 					     50) /
 					    100);
 	}
+}
+
+static Overlay
+overlay_plan(int height)
+{
+	Overlay o = {0};
+	int bottom;
+	int64_t begin, end, stop;
+	size_t i, j;
+	Message *m;
+
+	stop = opt.start + opt.duration;
+	begin = stop;
+	end = opt.start;
+	o.y = height;
+	bottom = 0;
+	for (i = 0; i < nmessages; i++) {
+		m = &messages[i];
+		if (m->time >= stop || m->time + opt.travel <= opt.start)
+			continue;
+		o.visible++;
+		if (m->time < begin)
+			begin = m->time;
+		if (m->time + opt.travel > end)
+			end = m->time + opt.travel;
+		if (m->y < o.y)
+			o.y = m->y;
+		if (m->y + lane_height > bottom)
+			bottom = m->y + lane_height;
+		for (j = 0; j < m->count; j++)
+			if (m->parts[j].asset != NONE)
+				assets[m->parts[j].asset].needed = 1;
+	}
+	if (end > stop)
+		end = stop;
+	o.first = frame_ceiling(begin - opt.start, opt.fps_num, opt.fps_den);
+	o.end = frame_ceiling(end - opt.start, opt.fps_num, opt.fps_den);
+	o.height = (bottom < height ? bottom : height) - o.y;
+	if (o.first >= o.end) {
+		/* A single transparent frame keeps the same RGB filter
+		 * negotiation even when no chat is sampled in this clip. */
+		o.y = 0;
+		o.height = 1;
+		o.first = 0;
+		o.end = 1;
+	}
+	return o;
 }
 
 static void
@@ -1633,6 +1861,7 @@ static void
 render(void)
 {
 	Video v;
+	Overlay overlay;
 	char fps[32], dimensions[32], start[32], duration[32];
 	char filter[512], *directory, *parent;
 	const char *extension;
@@ -1679,11 +1908,11 @@ render(void)
 			      NULL,
 			      NULL};
 	SDL_IOStream *log, *input;
-	int width, height, row;
+	int width, height, row, blank;
 	int64_t now, n;
 	Uint64 started, reported, ticks;
 	double elapsed;
-	size_t i, j, first, last, fallbacks, visible;
+	size_t i, first, last, fallbacks;
 
 	started = reported = SDL_GetTicks();
 	fprintf(stderr, "bullet: video: %s\n", opt.video);
@@ -1721,16 +1950,17 @@ render(void)
 	parent = dirnameof(opt.chat);
 	directory = format("%s/assets", parent);
 	free(parent);
-	visible = 0;
-	for (i = 0; i < nmessages; i++) {
-		if (messages[i].time >= opt.start + opt.duration ||
-		    messages[i].time + opt.travel <= opt.start)
-			continue;
-		visible++;
-		for (j = 0; j < messages[i].count; j++)
-			if (messages[i].parts[j].asset != NONE)
-				assets[messages[i].parts[j].asset].needed = 1;
+	overlay = overlay_plan(height);
+#ifdef BULLET_TEST
+	/* Test-only oracle: the original full-frame, full-duration stream. */
+	if (dense_reference) {
+		overlay.y = 0;
+		overlay.height = height;
+		overlay.first = 0;
+		overlay.end =
+		    frame_ceiling(opt.duration, opt.fps_num, opt.fps_den);
 	}
+#endif
 	fprintf(stderr, "bullet: preparing visible images and GIFs\n");
 	for (i = 0; i < nassets; i++) {
 		if (assets[i].needed) {
@@ -1740,17 +1970,22 @@ render(void)
 		}
 	}
 	free(directory);
-	canvas = surface(width, height);
+	canvas = surface(width, overlay.height);
 	snprintf(fps, sizeof fps, "%d/%d", opt.fps_num, opt.fps_den);
-	snprintf(dimensions, sizeof dimensions, "%dx%d", width, height);
+	snprintf(dimensions, sizeof dimensions, "%dx%d", width,
+		 overlay.height);
 	snprintf(start, sizeof start, "%.6f", (double)opt.start / SECOND);
 	snprintf(duration, sizeof duration, "%.6f",
 		 (double)opt.duration / SECOND);
+	/* Even transparent chat used the YUV -> RGB -> YUV round trip.
+	 * Keep that negotiation, not a YUV overlay or a direct base bypass.
+	 * Rawvideo PTS units are whole CFR frames, so the offset is exact. */
 	snprintf(filter, sizeof filter,
 		 "[0:v]fps=%s,scale=%d:%d:flags=lanczos,setsar=1,"
-		 "format=yuv420p[base];[base][1:v]overlay=0:0:format=auto:"
+		 "format=yuv420p[base];[1:v]setpts=PTS+%lld[chat];"
+		 "[base][chat]overlay=0:%d:format=auto:"
 		 "eof_action=pass:repeatlast=0,format=yuv420p[v]",
-		 fps, width, height);
+		 fps, width, height, (long long)overlay.first, overlay.y);
 	args[sizeof args / sizeof *args - 2] = stage;
 	/* Seeking at zero discards AAC priming packets; do not seek a full
 	 * VOD. */
@@ -1764,27 +1999,35 @@ render(void)
 	input = SDL_GetProcessInput(child);
 	check(input != NULL, "get FFmpeg input");
 	fprintf(stderr,
-		"bullet: %s, %s fps, %zu visible messages, "
+		"bullet: %dx%d, %s fps, %zu visible messages, "
 		"%zu overlap fallbacks\n",
-		dimensions, fps, visible, fallbacks);
+		width, height, fps, overlay.visible, fallbacks);
 	first = last = 0;
-	for (n = 0;; n++) {
+	blank = 1;
+	for (n = overlay.first; n < overlay.end; n++) {
 		now = opt.start + frame_time(n, opt.fps_num, opt.fps_den);
-		if (now >= opt.start + opt.duration)
-			break;
 		while (last < nmessages && messages[last].time <= now)
 			last++;
 		while (first < last &&
 		       messages[first].time + opt.travel <= now) {
-			surface_free(messages[first].sprite);
+			sprite_free(messages[first].sprite);
 			messages[first++].sprite = NULL;
 		}
-		drawframe(now, first, last);
+#ifdef BULLET_TEST
+		if (dense_reference)
+			blank = 0;
+#endif
+		/* Reuse transparent pixels across internal gaps. The pipe is
+		 * CFR, so gaps inside the transmitted interval still need
+		 * frames. */
+		if (first != last || !blank)
+			drawframe(now, first, last, overlay.y);
+		blank = first == last;
 		if (canvas->pitch == width * 4) {
 			writeall(input, canvas->pixels,
-				 (size_t)canvas->pitch * height);
+				 (size_t)canvas->pitch * canvas->h);
 		} else {
-			for (row = 0; row < height; row++)
+			for (row = 0; row < canvas->h; row++)
 				writeall(input,
 					 (unsigned char *)canvas->pixels +
 					     row * canvas->pitch,
@@ -1807,7 +2050,7 @@ render(void)
 		}
 	}
 	fprintf(stderr, "bullet: submitted %lld frames; waiting for FFmpeg\n",
-		(long long)n);
+		(long long)(n - overlay.first));
 	check(SDL_CloseIO(input), "close FFmpeg input");
 	waitchild();
 	check_destination();
@@ -2140,7 +2383,7 @@ main(int argc, char **argv)
 		}
 	}
 	if (argc == 2 && !strcmp(argv[1], "--version")) {
-		puts("bullet 0.0.0");
+		puts("bullet 0.1.0");
 		return 0;
 	}
 	atexit(cleanup);
