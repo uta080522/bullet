@@ -1,0 +1,14 @@
+BasedOnStyle: LLVM
+UseTab: Always
+IndentWidth: 8
+TabWidth: 8
+ColumnLimit: 79
+BreakBeforeBraces: Linux
+BreakAfterReturnType: AllDefinitions
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+IndentCaseLabels: false
+PointerAlignment: Right
+SortIncludes: Never
+ForEachMacros: [cJSON_ArrayForEach]

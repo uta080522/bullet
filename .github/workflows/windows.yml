@@ -1,0 +1,51 @@
+name: Windows C build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure test tools
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --yes --no-progress
+          }
+          if (-not (Test-Path C:/Windows/Fonts/meiryob.ttc)) {
+            $font = "$env:RUNNER_TEMP/NotoSansCJKjp-Bold.otf"
+            curl.exe --fail --location --output $font https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf
+            if ($LASTEXITCODE -ne 0) { throw "Font download failed" }
+            "BULLET_TEST_FONT=$font" >> $env:GITHUB_ENV
+          }
+          ffmpeg -version
+          ffprobe -version
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Collect dependency notices
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/notices
+          Get-ChildItem build/vcpkg_installed/x64-windows-static/share/*/copyright | ForEach-Object {
+            Copy-Item $_.FullName "build/notices/$($_.Directory.Name).txt"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bullet-windows-x64
+          path: |
+            build/Release/bullet.exe
+            build/notices/
+            LICENSE
+            README.md
+            README.ja.md
+            README.zh-CN.md
+            README.ko.md

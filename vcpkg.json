@@ -1,0 +1,13 @@
+{
+  "name": "bullet",
+  "version-string": "0.0.0",
+  "builtin-baseline": "48483a35f9e6f32572bc7c9382f14436cc7106a8",
+  "dependencies": [
+    { "name": "cjson", "default-features": false },
+    { "name": "curl", "default-features": false, "features": ["ssl"] },
+    { "name": "sdl3", "default-features": false },
+    { "name": "sdl3-image", "default-features": false, "features": ["png", "jpeg", "webp"] },
+    { "name": "sdl3-ttf", "default-features": false },
+    { "name": "openssl", "platform": "!windows" }
+  ]
+}

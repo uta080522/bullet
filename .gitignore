@@ -1,0 +1,7 @@
+/build/
+/data/
+*.mp4
+*.mkv
+*.webm
+*.live_chat.json
+*.chat.json
