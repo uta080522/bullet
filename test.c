@@ -141,6 +141,50 @@ reference_paste(SDL_Surface *to, const SDL_Surface *from, int x, int y)
 	}
 }
 
+/* Floating-point destination sampling, independent of the fixed-point
+ * span interpolation and sparse run representation. */
+static void
+reference_subpixel_paste(SDL_Surface *to, const SDL_Surface *from, double x,
+			 int y)
+{
+	const unsigned char clear[4] = {0};
+	const unsigned char *a, *b, *row;
+	unsigned char *p;
+	SDL_Surface *sample;
+	double position, fraction, alpha, value;
+	int dx, dy, sx, sy, c;
+
+	sample = surface(to->w, to->h);
+	for (dy = 0; dy < to->h; dy++) {
+		sy = dy - y;
+		if (sy < 0 || sy >= from->h)
+			continue;
+		row = (const unsigned char *)from->pixels + sy * from->pitch;
+		for (dx = 0; dx < to->w; dx++) {
+			position = dx - x;
+			sx = (int)floor(position);
+			fraction = position - sx;
+			a = sx >= 0 && sx < from->w ? row + sx * 4 : clear;
+			b = sx + 1 >= 0 && sx + 1 < from->w
+				? row + (sx + 1) * 4
+				: clear;
+			alpha = a[3] * (1 - fraction) + b[3] * fraction;
+			if (!alpha)
+				continue;
+			p = (unsigned char *)sample->pixels +
+			    dy * sample->pitch + dx * 4;
+			for (c = 0; c < 3; c++) {
+				value = a[c] * a[3] * (1 - fraction) +
+					b[c] * b[3] * fraction;
+				p[c] = (unsigned char)round(value / alpha);
+			}
+			p[3] = (unsigned char)round(alpha);
+		}
+	}
+	reference_paste(to, sample, 0, 0);
+	surface_free(sample);
+}
+
 static void
 surfaces_equal(const SDL_Surface *a, const SDL_Surface *b)
 {
@@ -198,7 +242,9 @@ blend_tests(void)
 static void
 sprite_tests(void)
 {
-	const int xs[] = {-80, -64, -63, -5, 0, 9, 32};
+	const double xs[] = {-80,   -64,  -63.75, -63,	 -5.75, -5,
+			     -0.75, -0.5, -0.25,  0,	 0.25,	0.5,
+			     0.75,  9,	  9.5,	  31.75, 32};
 	const int ys[] = {-8, -5, -1, 0, 3, 8};
 	SDL_Surface *source, *reference, *actual, *expected;
 	Sprite *sprite;
@@ -276,10 +322,10 @@ sprite_tests(void)
 						y * actual->pitch,
 					    32 * 4);
 				}
-				reference_paste(expected, reference, xs[i],
-						ys[j]);
-				reference_paste(expected, reference, xs[i] + 1,
-						ys[j] + 1);
+				reference_subpixel_paste(expected, reference,
+							 xs[i], ys[j]);
+				reference_subpixel_paste(expected, reference,
+							 xs[i] + 1, ys[j] + 1);
 				paste_sprite(actual, sprite, xs[i], ys[j]);
 				paste_sprite(actual, sprite, xs[i] + 1,
 					     ys[j] + 1);
@@ -293,6 +339,91 @@ sprite_tests(void)
 		expect(surface_bytes == before,
 		       "packed and dense sprite ownership");
 	}
+}
+
+static void
+subpixel_motion_tests(void)
+{
+	const int64_t times[] = {600000, 550000, 500000, 450000};
+	const unsigned char left[] = {255, 191, 128, 64};
+	const unsigned char right[] = {0, 64, 128, 191};
+	const unsigned char gif_expected[2][20] = {
+	    {0,	  0,  0,   0, 255, 255, 255, 64, 255, 255,
+	     255, 64, 255, 0, 0,   64,	255, 0,	 0,   64},
+	    {255, 255, 255, 64, 255, 255, 255, 64, 0, 0,
+	     255, 64,  0,   0,	255, 64,  0,   0,  0, 0}};
+	SDL_Surface *image;
+	Message *m;
+	Asset *a;
+	unsigned char *pixels;
+	size_t i, index, before;
+
+	before = surface_bytes;
+	canvas = surface(4, 1);
+	image = surface(1, 1);
+	memset(image->pixels, 255, 4);
+	m = message(0);
+	m->width = 1;
+	m->sprite = sprite_create(image);
+	opt.travel = SECOND;
+	opt.opacity = 100;
+	for (i = 0; i < sizeof times / sizeof *times; i++) {
+		drawframe(times[i], 0, 1, 0);
+		pixels = canvas->pixels;
+		expect(pixels[7] == left[i] && pixels[11] == right[i],
+		       "scrolling text retains fractional pixel coverage");
+		expect(pixels[3] == 0 && pixels[15] == 0,
+		       "subpixel movement only covers neighboring pixels");
+		expect(pixels[4] == 255 && pixels[5] == 255 &&
+			   pixels[6] == 255,
+		       "subpixel text preserves its straight RGB color");
+	}
+	drawframe(50000, 0, 1, 0);
+	pixels = canvas->pixels;
+	expect(pixels[15] == 64 && pixels[3] == 0 && pixels[7] == 0 &&
+		   pixels[11] == 0,
+	       "subpixel text enters at the right edge");
+	drawframe(850000, 0, 1, 0);
+	expect(pixels[3] == 191 && pixels[7] == 0 && pixels[11] == 0 &&
+		   pixels[15] == 0,
+	       "negative subpixel position clips at the left edge");
+	opt.opacity = 50;
+	drawframe(500000, 0, 1, 0);
+	expect(pixels[7] == 64 && pixels[11] == 64,
+	       "global opacity is applied after subpixel interpolation");
+
+	/* Text and animated images must use the same fractional phase. */
+	surface_free(canvas);
+	canvas = surface(5, 1);
+	lane_height = 1;
+	index = asset("https://example.com/subpixel.gif", 1);
+	a = &assets[index];
+	a->frames = resize(NULL, 2, sizeof *a->frames);
+	a->ends = resize(NULL, 2, sizeof *a->ends);
+	a->count = 2;
+	a->ends[0] = 450000;
+	a->ends[1] = 850000;
+	for (i = 0; i < 2; i++) {
+		a->frames[i] = surface(1, 1);
+		pixels = a->frames[i]->pixels;
+		pixels[i * 2] = 255;
+		pixels[3] = 255;
+	}
+	part(m, "", index);
+	m->parts[0].x = 2;
+	m->width = 3;
+	for (i = 0; i < 2; i++) {
+		drawframe(437500 + (int64_t)i * 125000, 0, 1, 0);
+		expect(
+		    !memcmp(canvas->pixels, gif_expected[i],
+			    sizeof gif_expected[i]),
+		    "text and GIF share subpixel movement, time and opacity");
+	}
+	freechat();
+	surface_free(canvas);
+	canvas = NULL;
+	memset(&opt, 0, sizeof opt);
+	expect(surface_bytes == before, "subpixel motion fixtures released");
 }
 
 static void
@@ -475,6 +606,7 @@ tests(void)
 
 	blend_tests();
 	sprite_tests();
+	subpixel_motion_tests();
 	frame_bounds_tests();
 	asset_frame_tests();
 	rate("30000/1001", &num, &den);

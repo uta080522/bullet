@@ -37,6 +37,7 @@
 #define MAX_PARTS 1000000
 #define MAX_ASSETS 4096
 #define MAX_FRAMES 500
+#define SUBPIXEL_SCALE 65536U
 #define NONE ((size_t)-1)
 
 static const int64_t default_travel = 5 * SECOND;
@@ -1522,41 +1523,94 @@ paste_pixels(unsigned char *d, const unsigned char *s, int count)
 	}
 }
 
-static void
-paste(SDL_Surface *to, const SDL_Surface *from, int x, int y)
+/* Keep 16 fractional bits while retaining the integer-position fast path. */
+static unsigned int
+subpixel_position(double x, int *pixel)
 {
-	int sy, left, top, right, bottom;
-	unsigned char *d;
-	const unsigned char *s;
+	unsigned int fraction;
 
+	*pixel = (int)floor(x);
+	fraction = (unsigned int)round((x - *pixel) * SUBPIXEL_SCALE);
+	if (fraction == SUBPIXEL_SCALE) {
+		(*pixel)++;
+		fraction = 0;
+	}
+	return fraction;
+}
+
+static void
+paste_row(SDL_Surface *to, const unsigned char *pixels, int count, int x,
+	  int y, unsigned int fraction)
+{
+	const unsigned char clear[4] = {0};
+	const unsigned char *a, *b;
+	unsigned char *d, sample[4];
+	unsigned int aw, bw, alpha, value;
+	int i, c, left, right, end;
+
+	end = count + (fraction != 0);
 	left = x < 0 ? -x : 0;
-	top = y < 0 ? -y : 0;
-	right = from->w < to->w - x ? from->w : to->w - x;
-	bottom = from->h < to->h - y ? from->h : to->h - y;
+	right = end < to->w - x ? end : to->w - x;
 	if (left >= right)
 		return;
-	for (sy = top; sy < bottom; sy++) {
-		s = (const unsigned char *)from->pixels + sy * from->pitch +
-		    left * 4;
-		d = (unsigned char *)to->pixels + (y + sy) * to->pitch +
-		    (x + left) * 4;
-		paste_pixels(d, s, right - left);
+	d = (unsigned char *)to->pixels + y * to->pitch + (x + left) * 4;
+	if (!fraction) {
+		paste_pixels(d, pixels + left * 4, right - left);
+		return;
+	}
+	/* Interpolate premultiplied colour, then source-over only once.
+	 * Transparent RGB must not bleed into text or emote edges. */
+	for (i = left; i < right; i++, d += 4) {
+		a = i ? pixels + (i - 1) * 4 : clear;
+		b = i < count ? pixels + i * 4 : clear;
+		aw = a[3] * fraction;
+		bw = b[3] * (SUBPIXEL_SCALE - fraction);
+		alpha = aw + bw;
+		if (!alpha)
+			continue;
+		for (c = 0; c < 3; c++) {
+			value = a[c] * aw + b[c] * bw;
+			sample[c] =
+			    (unsigned char)((value + alpha / 2) / alpha);
+		}
+		sample[3] = (unsigned char)((alpha + SUBPIXEL_SCALE / 2) /
+					    SUBPIXEL_SCALE);
+		paste_pixels(d, sample, 1);
 	}
 }
 
 static void
-paste_sprite(SDL_Surface *to, const Sprite *s, int x, int y)
+paste(SDL_Surface *to, const SDL_Surface *from, double x, int y)
+{
+	int pixel, sy, top, bottom;
+	unsigned int fraction;
+	const unsigned char *s;
+
+	if (x >= to->w || x + from->w <= 0)
+		return;
+	fraction = subpixel_position(x, &pixel);
+	top = y < 0 ? -y : 0;
+	bottom = from->h < to->h - y ? from->h : to->h - y;
+	for (sy = top; sy < bottom; sy++) {
+		s = (const unsigned char *)from->pixels + sy * from->pitch;
+		paste_row(to, s, from->w, pixel, y + sy, fraction);
+	}
+}
+
+static void
+paste_sprite(SDL_Surface *to, const Sprite *s, double x, int y)
 {
 	Run run;
 	size_t offset;
-	int dx, dy, left, right;
-	unsigned char *d;
+	int pixel, dy;
+	unsigned int fraction;
 	const unsigned char *pixels;
 
 	if (s->pixels) {
 		paste(to, s->pixels, x, y);
 		return;
 	}
+	fraction = subpixel_position(x, &pixel);
 	for (offset = 0; offset < s->bytes;) {
 		memcpy(&run, s->runs + offset, sizeof run);
 		pixels = s->runs + offset + sizeof run;
@@ -1566,14 +1620,7 @@ paste_sprite(SDL_Surface *to, const Sprite *s, int x, int y)
 			continue;
 		if (dy >= to->h)
 			break;
-		dx = x + run.x;
-		left = dx < 0 ? -dx : 0;
-		right = run.width < to->w - dx ? run.width : to->w - dx;
-		if (left >= right)
-			continue;
-		d = (unsigned char *)to->pixels + dy * to->pitch +
-		    (dx + left) * 4;
-		paste_pixels(d, pixels + left * 4, right - left);
+		paste_row(to, pixels, run.width, pixel + run.x, dy, fraction);
 	}
 }
 
@@ -1754,14 +1801,15 @@ drawframe(int64_t now, size_t first, size_t last, int top)
 	Part *p;
 	SDL_Surface *image;
 	size_t i, j;
-	int x, row, column;
+	int row, column;
+	double x;
 	unsigned char *pixels;
 
 	memset(canvas->pixels, 0, (size_t)canvas->pitch * canvas->h);
 	for (i = first; i < last; i++) {
 		m = &messages[i];
-		x = (int)round(canvas->w - (canvas->w + (double)m->width) *
-					       (now - m->time) / opt.travel);
+		x = canvas->w - (canvas->w + (double)m->width) *
+				    (now - m->time) / opt.travel;
 		if (x >= canvas->w || x + m->width <= 0)
 			continue;
 		if (!m->sprite)

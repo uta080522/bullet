@@ -29,6 +29,8 @@ bullet render VIDEO --start 60 --duration 15 --output clip.mp4
 
 Use `--font` to select a font, `--force` to replace an existing output, and `bullet --help` for all options. Windows uses Meiryo Bold by default. bullet saves downloaded emotes in `assets/` next to the chat file; it copies the audio stream into the output. The source video's average frame rate determines the output's constant frame rate.
 
+Scrolling text, images and GIFs use subpixel positioning to reduce jitter from whole-pixel rounding. Their timing and crossing speed are unchanged.
+
 ## Building
 
 Windows x64 builds use CMake 3.24+, a C compiler, and [vcpkg](https://github.com/microsoft/vcpkg). Set `VCPKG_ROOT` and run these commands in a Visual Studio Developer PowerShell:

@@ -29,6 +29,8 @@ bullet render VIDEO --start 60 --duration 15 --output clip.mp4
 
 フォントの指定には`--font`、既存の出力の置換には`--force`を使います。全オプションは`bullet --help`で確認できます。Windowsの既定フォントはメイリオ太字です。取得した絵文字はチャットの隣の`assets/`に保存し、音声はそのままコピーします。出力は元動画の平均フレームレートを使った一定フレームレートです。
 
+整数ピクセルへの丸めによる揺れを抑えるため、文字・画像・GIFの横移動にはサブピクセル描画を使います。表示時刻と横断速度は変わりません。
+
 ## ビルド
 
 Windows x64ではCMake 3.24以上、Cコンパイラー、[vcpkg](https://github.com/microsoft/vcpkg)を使用します。`VCPKG_ROOT`を設定し、Visual Studio Developer PowerShellで実行してください。

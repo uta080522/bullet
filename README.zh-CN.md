@@ -29,6 +29,8 @@ bullet render VIDEO --start 60 --duration 15 --output clip.mp4
 
 使用 `--font` 指定字体、`--force` 替换已有输出。运行 `bullet --help` 查看所有选项。Windows 默认使用 Meiryo Bold。获取的表情图片存放在聊天文件旁的 `assets/` 中；音频流直接复制到输出视频。输出采用原视频的平均帧率，生成恒定帧率的视频。
 
+为减少整像素取整导致的抖动，滚动文字、图片和 GIF 采用子像素定位。显示时间和横穿速度保持不变。
+
 ## 构建
 
 Windows x64 构建使用 CMake 3.24+、C 编译器和 [vcpkg](https://github.com/microsoft/vcpkg)。设置 `VCPKG_ROOT`，在 Visual Studio Developer PowerShell 中运行：
