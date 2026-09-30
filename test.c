@@ -1,4 +1,4 @@
-/* White-box tests and offline stand-ins for the two download tools. */
+/* White-box tests, an exact-pixel encoder, and offline download tools. */
 #define BULLET_TEST
 #include "bullet.c"
 
@@ -51,28 +51,30 @@ fake_tool(int argc, char **argv)
 	writeall(io, argv[1], strlen(argv[1]));
 	writeall(io, "\n", 1);
 	check(SDL_CloseIO(io), "close fake tool log");
-	if (SDL_getenv("BULLET_TOOL_FAIL") && *SDL_getenv("BULLET_TOOL_FAIL"))
-		die("test downloader failed");
 	if (!strcmp(argv[1], "chatdownload")) {
 		copyfile(SDL_getenv("BULLET_FIXTURE_CHAT"),
 			 valueof(argc, argv, "--output"));
-		return;
-	}
-	dir = valueof(argc, argv, "-P");
-	check(SDL_CreateDirectory(dir), "create fake download directory");
-	if (strstr(argv[argc - 1], "twitch.tv")) {
-		id = strrchr(argv[argc - 1], '/') + 1;
-		path = format("%s/v%s.mp4", dir, id);
 	} else {
-		path = format("%s/fixture.mp4", dir);
-		chat = format("%s/fixture.live_chat.json", dir);
-		copyfile(SDL_getenv("BULLET_FIXTURE_YOUTUBE"), chat);
-		free(chat);
+		dir = valueof(argc, argv, "-P");
+		check(SDL_CreateDirectory(dir),
+		      "create fake download directory");
+		if (strstr(argv[argc - 1], "twitch.tv")) {
+			id = strrchr(argv[argc - 1], '/') + 1;
+			path = format("%s/v%s.mp4", dir, id);
+		} else {
+			path = format("%s/fixture.mp4", dir);
+			chat = format("%s/fixture.live_chat.json", dir);
+			copyfile(SDL_getenv("BULLET_FIXTURE_YOUTUBE"), chat);
+			free(chat);
+		}
+		if (!exists(path))
+			copyfile(SDL_getenv("BULLET_FIXTURE_VIDEO"), path);
+		puts(path);
+		free(path);
 	}
-	if (!exists(path))
-		copyfile(SDL_getenv("BULLET_FIXTURE_VIDEO"), path);
-	puts(path);
-	free(path);
+	/* Leave written output behind for the real owner to handle. */
+	if (SDL_getenv("BULLET_TOOL_FAIL") && *SDL_getenv("BULLET_TOOL_FAIL"))
+		die("test downloader failed");
 }
 
 static int
@@ -601,34 +603,68 @@ static unsigned int cli_checks;
 static const char *cli_program;
 
 static void
-run_case(int success, const char *program, ...)
+command_case(int success, const char *error, const char *program, va_list ap)
 {
 	const char *args[80], *arg;
-	va_list ap;
-	size_t n, i;
+	char *path;
+	unsigned char *diagnostic;
+	SDL_IOStream *log;
+	size_t n, i, length;
 	int status;
 
 	args[0] = program;
 	n = 1;
-	va_start(ap, program);
 	while ((arg = va_arg(ap, const char *)) != NULL) {
 		expect(n + 1 < sizeof args / sizeof *args, "argument limit");
 		args[n++] = arg;
 	}
-	va_end(ap);
 	args[n] = NULL;
-	spawn(args, 0, 0, NULL);
+	path = format("%s/command.stderr", workdir);
+	log = SDL_IOFromFile(path, "wb");
+	check(log != NULL, "create test command log");
+	spawn(args, 0, 0, log);
+	check(SDL_CloseIO(log), "close test command log");
 	check(SDL_WaitProcess(child, true, &status), "wait for test command");
 	SDL_DestroyProcess(child);
 	child = NULL;
+	diagnostic = readfile(path, MAX_JSON, &length);
+	free(path);
 	if ((status == 0) != success ||
-	    (!success && !strcmp(program, cli_program) && status != 1)) {
+	    (!success && !strcmp(program, cli_program) && status != 1) ||
+	    (error && !strstr((const char *)diagnostic, error))) {
 		for (i = 0; i < n; i++)
 			fprintf(stderr, "%s ", args[i]);
 		fputc('\n', stderr);
-		die("unexpected exit %d", status);
+		fputs((const char *)diagnostic, stderr);
+		die("expected %s, got exit %d",
+		    error     ? error
+		    : success ? "success"
+			      : "failure",
+		    status);
 	}
+	free(diagnostic);
 	cli_checks++;
+}
+
+static void
+run_case(int success, const char *program, ...)
+{
+	va_list ap;
+
+	va_start(ap, program);
+	command_case(success, NULL, program, ap);
+	va_end(ap);
+}
+
+/* Exit 1 alone also accepts failures from unrelated guards or tools. */
+static void
+reject_case(const char *error, const char *program, ...)
+{
+	va_list ap;
+
+	va_start(ap, program);
+	command_case(0, error, program, ap);
+	va_end(ap);
 }
 
 static void
@@ -652,6 +688,102 @@ test_env(const char *key, const char *value)
 	check(
 	    SDL_SetEnvironmentVariable(SDL_GetEnvironment(), key, value, true),
 	    "set SDL environment");
+}
+
+static void
+reference_encoder(int enabled)
+{
+	const char *key, *value;
+	char *name, *path;
+
+	key = SDL_getenv("BULLET_PATH_KEY");
+	value = SDL_getenv(enabled ? "BULLET_REFERENCE_PATH"
+				   : "BULLET_ORIGINAL_PATH");
+	expect(key && value, "reference encoder environment");
+	name = copystr(key);
+	path = copystr(value);
+	test_env("BULLET_REFERENCE_ENCODER", enabled ? "1" : "");
+	test_env(name, path);
+	free(name);
+	free(path);
+}
+
+static char *
+ffmpeg_path(const char *search)
+{
+#ifdef _WIN32
+	wchar_t *w;
+	char *utf8, *path;
+	DWORD n;
+
+	(void)search;
+	w = resize(NULL, 32768, sizeof *w);
+	n = SearchPathW(NULL, L"ffmpeg.exe", NULL, 32768, w, NULL);
+	expect(n && n < 32768, "locate real FFmpeg");
+	utf8 = SDL_iconv_string("UTF-8", "UTF-16LE", (const char *)w,
+				((size_t)n + 1) * sizeof *w);
+	expect(utf8 != NULL, "convert FFmpeg path");
+	path = copystr(utf8);
+	SDL_free(utf8);
+	free(w);
+	return path;
+#else
+	const char *p, *end;
+	char *path;
+	SDL_PathInfo info;
+	size_t length;
+
+	for (p = search;; p = end + 1) {
+		end = strchr(p, ':');
+		length = end ? (size_t)(end - p) : strlen(p);
+		expect(length <= INT_MAX, "search path length");
+		path = length ? format("%.*s/ffmpeg", (int)length, p)
+			      : copystr("./ffmpeg");
+		if (SDL_GetPathInfo(path, &info) &&
+		    info.type == SDL_PATHTYPE_FILE && !access(path, X_OK))
+			return path;
+		free(path);
+		if (!end)
+			die("test tool: cannot find FFmpeg");
+	}
+#endif
+}
+
+static void
+reference_ffmpeg(int argc, char **argv)
+{
+	const char *args[80];
+	SDL_PropertiesID props;
+	size_t n;
+	int i;
+
+	/* Windows searches the proxy's own directory before PATH. */
+	reference_encoder(0);
+	args[0] = SDL_getenv("BULLET_REAL_FFMPEG");
+	expect(args[0] != NULL, "real FFmpeg path");
+	n = 1;
+	for (i = 1; i < argc; i++) {
+		expect(n + 1 < sizeof args / sizeof *args, "argument limit");
+		/* Exact pixel checks must not include lossy encoder artifacts.
+		 * GIF decoding and other FFmpeg arguments pass through. */
+		args[n++] = !strcmp(argv[i - 1], "-crf") ? "0" : argv[i];
+	}
+	args[n] = NULL;
+	props = SDL_CreateProperties();
+	check(props != 0, "create reference process properties");
+	check(SDL_SetPointerProperty(
+		  props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, (void *)args),
+	      "set reference args");
+	/* SDL defaults stdin to NULL; forward the producer's RGBA pipe. */
+	check(SDL_SetNumberProperty(props,
+				    SDL_PROP_PROCESS_CREATE_STDIN_NUMBER,
+				    SDL_PROCESS_STDIO_INHERITED),
+	      "inherit reference input");
+	child = SDL_CreateProcessWithProperties(props);
+	SDL_DestroyProperties(props);
+	if (!child)
+		die("cannot start %s: %s", args[0], SDL_GetError());
+	waitchild();
 }
 
 static char *
@@ -725,6 +857,8 @@ media_equal(const char *a, const char *b)
 	x = capture(args);
 	args[4] = b;
 	y = capture(args);
+	if (strcmp(x, y))
+		fprintf(stderr, "media mismatch: %s vs %s\n", a, b);
 	expect(!strcmp(x, y), "decoded pixels, audio packets and timestamps "
 			      "equal dense reference");
 	free(x);
@@ -741,6 +875,8 @@ render_equal(const char *bullet, const char *tool, const char *source,
 
 	compact = fixture("compact.mp4", NULL);
 	dense = fixture("dense.mp4", NULL);
+	/* Normal CLI cases retain the production encoder configuration. */
+	reference_encoder(1);
 	run_case(1, bullet, "render", source, chat, "--output", compact,
 		 "--force", "--font", test_font, "--start", start,
 		 "--duration", duration, "--travel-time", travel, "--opacity",
@@ -751,6 +887,7 @@ render_equal(const char *bullet, const char *tool, const char *source,
 		 "--duration", duration, "--travel-time", travel, "--opacity",
 		 opacity, "--text-style", style, "--fps", fps,
 		 "--output-height", height, NULL);
+	reference_encoder(0);
 	media_equal(compact, dense);
 	audio_equal(compact, dense);
 	free(compact);
@@ -776,6 +913,15 @@ remove_entry(void *unused, const char *dir, const char *name)
 	return SDL_ENUM_CONTINUE;
 }
 
+static SDL_EnumerationResult SDLCALL
+count_entry(void *data, const char *dir, const char *name)
+{
+	(void)dir;
+	if (strcmp(name, ".") && strcmp(name, ".."))
+		(*(size_t *)data)++;
+	return SDL_ENUM_CONTINUE;
+}
+
 static void
 cli_tests(const char *bullet, const char *tool)
 {
@@ -786,27 +932,37 @@ cli_tests(const char *bullet, const char *tool)
 	char *backup, *log, *partial, *broken, *invalid, *portrait, *alias;
 	char *yt, *tools, *dir, *cached, *path, *text, *other, *image;
 	char *oldpath, *fake_bin, *fake_ffmpeg, *auto_video, *auto_chat;
-	char *auto_output, *second_chat;
+	char *auto_output, *second_chat, *path_key, *encoder_path,
+	    *real_ffmpeg;
 	unsigned char *data;
-	size_t n, i;
+	size_t n, i, entries, before_entries;
 	Video v;
 	SDL_Surface *png;
 	SDL_IOStream *io;
-	const char *bad_options[][2] = {
-	    {"--start", "-1"},
-	    {"--start", "nan"},
-	    {"--duration", "0"},
-	    {"--opacity", "101"},
-	    {"--fps", "0/0"},
-	    {"--fps", "nan"},
-	    {"--text-style", "other"},
-	    {"--output-height", "3"},
-	    {"--hls-start", "2026-02-30T00:00:00Z"},
-	    {"--hls-start", "2026-01-01T00:00:00"}};
-	const char *bad_json[] = {
-	    "{}", "{\"comments\":[]}",
-	    ("{\"comments\":[{\"content_offset_seconds\":-1,"
-	     "\"message\":{\"body\":\"bad\"}}]}")};
+	const struct {
+		const char *key, *value, *error;
+	} bad_options[] = {
+	    {"--start", "-1", "time is outside 0..7 days"},
+	    {"--start", "nan", "invalid number"},
+	    {"--duration", "0", "duration must be positive"},
+	    {"--opacity", "101", "expected an integer in 0..100"},
+	    {"--fps", "0/0", "invalid frame rate"},
+	    {"--fps", "nan", "invalid frame rate"},
+	    {"--text-style", "other",
+	     "--text-style must be outline or shadow"},
+	    {"--output-height", "3", "output dimensions must be even"},
+	    {"--hls-start", "2026-02-30T00:00:00Z",
+	     "invalid RFC3339 timestamp"},
+	    {"--hls-start", "2026-01-01T00:00:00",
+	     "invalid RFC3339 timestamp"}};
+	const struct {
+		const char *text, *error;
+	} bad_json[] = {
+	    {"{}", "missing replayChatItemAction"},
+	    {"{\"comments\":[]}", "no text or emoji messages found"},
+	    {"{\"comments\":[{\"content_offset_seconds\":-1,"
+	     "\"message\":{\"body\":\"bad\"}}]}",
+	     "time is outside 0..7 days"}};
 	const char *twitch = "{\"FileInfo\" : {},\"comments\":[{"
 			     "\"content_offset_seconds\":0,"
 			     "\"created_at\":\"2026-01-01T00:00:00.5Z\","
@@ -830,6 +986,7 @@ cli_tests(const char *bullet, const char *tool)
 	    "{\"emoticon\":{\"emoticon_id\":\"2\"}}]}}]}";
 #ifdef _WIN32
 	wchar_t *wa, *wb;
+	char **environment;
 #endif
 
 	cli_program = bullet;
@@ -854,6 +1011,44 @@ cli_tests(const char *bullet, const char *tool)
 			}
 	}
 	expect(test_font != NULL, "font for CLI tests");
+	path_key = copystr("PATH");
+#ifdef _WIN32
+	/* SDL's environment is case-sensitive, unlike Windows' Path. */
+	environment = SDL_GetEnvironmentVariables(SDL_GetEnvironment());
+	expect(environment != NULL, "read test environment");
+	for (i = 0; environment[i]; i++) {
+		if (!SDL_strncasecmp(environment[i], "PATH=", 5)) {
+			environment[i][4] = 0;
+			free(path_key);
+			path_key = copystr(environment[i]);
+			break;
+		}
+	}
+	SDL_free(environment);
+#endif
+	tmp = SDL_getenv(path_key);
+	expect(tmp != NULL, "PATH for CLI tests");
+	oldpath = copystr(tmp);
+	fake_bin = fixture("fake-bin", NULL);
+	check(SDL_CreateDirectory(fake_bin), "create test bin directory");
+#ifdef _WIN32
+	fake_ffmpeg = format("%s/ffmpeg.exe", fake_bin);
+	encoder_path = format("%s;%s", fake_bin, oldpath);
+#else
+	fake_ffmpeg = format("%s/ffmpeg", fake_bin);
+	encoder_path = format("%s:%s", fake_bin, oldpath);
+#endif
+	copyfile(tool, fake_ffmpeg);
+#ifndef _WIN32
+	expect(chmod(fake_ffmpeg, 0700) == 0, "executable test tool");
+#endif
+	test_env("BULLET_PATH_KEY", path_key);
+	test_env("BULLET_ORIGINAL_PATH", oldpath);
+	test_env("BULLET_REFERENCE_PATH", encoder_path);
+	test_env("BULLET_REFERENCE_ENCODER", "");
+	real_ffmpeg = ffmpeg_path(oldpath);
+	test_env("BULLET_REAL_FFMPEG", real_ffmpeg);
+	free(real_ffmpeg);
 	run_case(1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
 		 "testsrc2=s=160x90:r=30000/1001", "-f", "lavfi", "-i",
 		 "sine=frequency=1000:sample_rate=48000", "-t", "2", "-c:v",
@@ -875,17 +1070,19 @@ cli_tests(const char *bullet, const char *tool)
 		 "--duration", "0.3", NULL);
 	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", auto_output,
 		 "-f", "null", "-", NULL);
-	run_case(0, bullet, "render", auto_video, "--font", test_font, NULL);
+	reject_case("output exists", bullet, "render", auto_video, "--font",
+		    test_font, NULL);
 	writefile(second_chat, youtube, strlen(youtube));
-	run_case(0, bullet, "render", auto_video, "--font", test_font,
-		 "--force", NULL);
+	reject_case("both chat formats exist", bullet, "render", auto_video,
+		    "--font", test_font, "--force", NULL);
 	run_case(1, bullet, "render", auto_video, auto_chat, "--duration",
 		 "0.3", "--force", "--font", test_font, NULL);
 	check(SDL_RemovePath(auto_chat), "remove mock Twitch chat");
 	run_case(1, bullet, "render", auto_video, "--duration", "0.3",
 		 "--force", "--font", test_font, NULL);
 	check(SDL_RemovePath(second_chat), "remove mock YouTube chat");
-	run_case(0, bullet, "render", auto_video, "--force", NULL);
+	reject_case("no chat beside VIDEO", bullet, "render", auto_video,
+		    "--force", NULL);
 	samebytes(auto_video, source);
 	free(auto_video);
 	free(auto_chat);
@@ -909,7 +1106,8 @@ cli_tests(const char *bullet, const char *tool)
 	render_equal(bullet, tool, source, path, test_font, "0.05", "1.8",
 		     "0.3", "50", "shadow", "113394000/3780913", "180");
 	free(path);
-	run_case(0, bullet, "render", original, "--output", result, NULL);
+	reject_case("no chat beside VIDEO", bullet, "render", original,
+		    "--output", result, NULL);
 	run_case(1, bullet, "render", source, chat, "--output", result,
 		 "--font", test_font, NULL);
 	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", result, "-f",
@@ -918,14 +1116,16 @@ cli_tests(const char *bullet, const char *tool)
 	expect(v.fps_num == 30000 && v.fps_den == 1001, "CLI rational fps");
 	audio_equal(source, result);
 	copyfile(result, saved);
-	run_case(0, bullet, "render", source, chat, "--output", result, NULL);
+	reject_case("output exists", bullet, "render", source, chat,
+		    "--output", result, NULL);
 	samebytes(result, saved);
 	run_case(1, bullet, "render", source, chat, "--output", result,
 		 "--force", "--duration", "0.3", "--font", test_font, NULL);
-	run_case(0, bullet, "render", source, chat, "--output", source,
-		 "--force", NULL);
-	run_case(0, bullet, "render", source, chat, "--output", chat,
-		 "--force", NULL);
+	reject_case("output cannot be the source video or chat", bullet,
+		    "render", source, chat, "--output", source, "--force",
+		    NULL);
+	reject_case("output cannot be the source video or chat", bullet,
+		    "render", source, chat, "--output", chat, "--force", NULL);
 	alias = fixture("hardlink.mp4", NULL);
 #ifdef _WIN32
 	wa = wide(alias);
@@ -936,8 +1136,9 @@ cli_tests(const char *bullet, const char *tool)
 #else
 	expect(link(source, alias) == 0, "create test hardlink");
 #endif
-	run_case(0, bullet, "render", source, chat, "--output", alias,
-		 "--force", NULL);
+	reject_case("output cannot be the source video or chat", bullet,
+		    "render", source, chat, "--output", alias, "--force",
+		    NULL);
 	samebytes(source, alias);
 	free(alias);
 
@@ -974,19 +1175,26 @@ cli_tests(const char *bullet, const char *tool)
 	run_case(0, "ffmpeg", "-v", "error", "-xerror", "-i", broken, "-f",
 		 "null", "-", NULL);
 	copyfile(result, saved);
-	run_case(0, bullet, "render", broken, chat, "--output", result,
-		 "--force", "--font", test_font, NULL);
+	/* Decoder failure can reach the pipe write or the process wait.
+	 * Require the FFmpeg phase, not one timing-dependent symptom. */
+	reject_case("FFmpeg log:", bullet, "render", broken, chat, "--output",
+		    result, "--force", "--font", test_font, NULL);
 	samebytes(result, saved);
 	free(broken);
 	for (i = 0; i < sizeof bad_options / sizeof *bad_options; i++)
-		run_case(0, bullet, "render", source, chat, "--output",
-			 invalid, bad_options[i][0], bad_options[i][1], NULL);
+		reject_case(bad_options[i].error, bullet, "render", source,
+			    chat, "--output", invalid, bad_options[i].key,
+			    bad_options[i].value, NULL);
 	path = fixture("bad.json", NULL);
 	for (i = 0; i < sizeof bad_json / sizeof *bad_json; i++) {
-		writefile(path, bad_json[i], strlen(bad_json[i]));
-		run_case(0, bullet, "render", source, path, "--output",
-			 invalid, "--font", test_font, NULL);
+		writefile(path, bad_json[i].text, strlen(bad_json[i].text));
+		reject_case(bad_json[i].error, bullet, "render", source, path,
+			    "--output", invalid, "--font", test_font, NULL);
 	}
+	/* Include the terminator: a valid JSON prefix must not hide NUL. */
+	writefile(path, twitch, strlen(twitch) + 1);
+	reject_case("NUL byte in JSON input", bullet, "render", source, path,
+		    "--output", invalid, "--font", test_font, NULL);
 	free(path);
 	expect(!exists(invalid), "failed render does not publish an output");
 	run_case(1, bullet, "render", source, chat, "--output", result,
@@ -1051,8 +1259,8 @@ cli_tests(const char *bullet, const char *tool)
 	path = fixture("bad-gif.json", text);
 	free(text);
 	copyfile(result, saved);
-	run_case(0, bullet, "render", source, path, "--output", result,
-		 "--force", "--font", test_font, NULL);
+	reject_case("external command failed", bullet, "render", source, path,
+		    "--output", result, "--force", "--font", test_font, NULL);
 	samebytes(result, saved);
 	free(path);
 	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/broken/default/"
@@ -1094,52 +1302,55 @@ cli_tests(const char *bullet, const char *tool)
 	samebytes(tools, cached);
 	samebytes(path, source);
 	writefile(path, "truncated", 9);
-	run_case(0, bullet, "download", "https://www.twitch.tv/videos/123",
-		 "--dir", dir, NULL);
+	reject_case("external command failed", bullet, "download",
+		    "https://www.twitch.tv/videos/123", "--dir", dir, NULL);
 	samebytes(tools, cached);
+	before_entries = 0;
+	check(SDL_EnumerateDirectory(dir, count_entry, &before_entries),
+	      "count files before failed download");
 	test_env("BULLET_TOOL_FAIL", "1");
-	run_case(0, bullet, "download", "https://www.twitch.tv/videos/456",
-		 "--dir", dir, NULL);
+	reject_case("test downloader failed", bullet, "download",
+		    "https://www.twitch.tv/videos/456", "--dir", dir, NULL);
 	other = format("%s/v456.chat.json", dir);
 	expect(!exists(other), "failed downloader does not publish chat");
 	free(other);
+	other = format("%s/v456.mp4", dir);
+	expect(!exists(other), "chat failure stops before video download");
+	free(other);
+	entries = 0;
+	check(SDL_EnumerateDirectory(dir, count_entry, &entries),
+	      "count files after failed download");
+	expect(entries == before_entries,
+	       "failed downloader cleans staging directory");
+	other = format("%s/v123.chat.json", dir);
+	samebytes(other, chat);
+	free(other);
+	other = fixture("truncated-before.mp4", "truncated");
+	samebytes(path, other);
+	free(other);
 	test_env("BULLET_TOOL_FAIL", "");
-	run_case(0, bullet, "download", "http://www.youtube.com/watch?v=x",
-		 "--dir", dir, NULL);
-	run_case(0, bullet, "download", "https://example.com/video", "--dir",
-		 dir, NULL);
+	reject_case("expected a public HTTPS archive URL", bullet, "download",
+		    "http://www.youtube.com/watch?v=x", "--dir", dir, NULL);
+	reject_case("only YouTube and Twitch archive URLs are supported",
+		    bullet, "download", "https://example.com/video", "--dir",
+		    dir, NULL);
 	free(yt);
 	free(tools);
 	free(dir);
 	free(path);
 	free(cached);
 
-	/* Force an early consumer exit to exercise broken-pipe cleanup. */
-	fake_bin = fixture("fake-bin", NULL);
-	check(SDL_CreateDirectory(fake_bin), "create test bin directory");
-#ifdef _WIN32
-	fake_ffmpeg = format("%s/ffmpeg.exe", fake_bin);
-#else
-	fake_ffmpeg = format("%s/ffmpeg", fake_bin);
-#endif
-	copyfile(tool, fake_ffmpeg);
-#ifndef _WIN32
-	expect(chmod(fake_ffmpeg, 0700) == 0, "executable test tool");
-#endif
-	oldpath = copystr(SDL_getenv("PATH"));
-#ifdef _WIN32
-	text = format("%s;%s", fake_bin, oldpath);
-#else
-	text = format("%s:%s", fake_bin, oldpath);
-#endif
-	test_env("PATH", text);
+	/* With reference mode off, the same stand-in exits without reading
+	 * input to exercise broken-pipe cleanup. */
+	test_env(path_key, encoder_path);
 	copyfile(result, saved);
-	run_case(0, bullet, "render", source, chat, "--output", result,
-		 "--force", "--font", test_font, NULL);
+	reject_case("write failed", bullet, "render", source, chat, "--output",
+		    result, "--force", "--font", test_font, NULL);
 	samebytes(result, saved);
-	test_env("PATH", oldpath);
+	test_env(path_key, oldpath);
+	free(path_key);
 	free(oldpath);
-	free(text);
+	free(encoder_path);
 	free(fake_ffmpeg);
 	free(fake_bin);
 	samebytes(source, original);
@@ -1170,6 +1381,13 @@ main(int argc, char **argv)
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
 		die("initialize HTTP library");
 	if (argc > 1) {
+		if (SDL_getenv("BULLET_REFERENCE_ENCODER") &&
+		    *SDL_getenv("BULLET_REFERENCE_ENCODER") &&
+		    (!SDL_strcasecmp(basenameof(argv[0]), "ffmpeg") ||
+		     !SDL_strcasecmp(basenameof(argv[0]), "ffmpeg.exe"))) {
+			reference_ffmpeg(argc, argv);
+			return 0;
+		}
 		if (!strcmp(argv[1], "--version")) {
 			puts("bullet offline test tool");
 			return 0;
