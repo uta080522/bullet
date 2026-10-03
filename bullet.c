@@ -109,22 +109,54 @@ typedef struct {
 	char *directory, *payload;
 } CacheStage;
 
-static Options opt;
-static Message *messages;
-static Asset *assets;
-static size_t nmessages, nassets, nparts, surface_bytes;
-static TTF_Font *font;
-static SDL_Surface *canvas;
-static SDL_Process *child;
-static char *workdir, *stage, *asset_temp, *logpath;
-static CacheStage cache_stage;
-static char *inferred_chat, *inferred_output;
-static int keep_log;
-static const char *chat_context;
-static int font_size, outline, gap, lane_height, emote_height;
+typedef struct {
+	Message *messages;
+	Asset *assets;
+	size_t nmessages, nassets, nparts;
+} Chat;
+
+typedef struct {
+	TTF_Font *font;
+	int font_size, outline, gap, lane_height, emote_height;
+} Glyphs;
+
+typedef struct {
+	int width, height, fps_num, fps_den;
+	int64_t start, duration, travel;
+	int opacity, shadow;
+} RenderPlan;
+
+typedef struct {
+	RenderPlan plan;
+	SDL_Surface *canvas;
+	size_t surface_bytes;
 #ifdef BULLET_TEST
-static int dense_reference;
+	int dense_reference;
 #endif
+} Renderer;
+
+typedef struct {
+	char *directory, *stage, *asset_temp, *logpath;
+	SDL_IOStream *log;
+	int keep_log;
+} OutputWork;
+
+typedef struct {
+	Options options;
+	Chat chat;
+	Glyphs glyphs;
+	Renderer renderer;
+	OutputWork work;
+	CacheStage cache_stage;
+	SDL_Process *child;
+	char *inferred_chat, *inferred_output;
+	const char *chat_context;
+#ifdef BULLET_TEST
+	int fail_next_resize, fail_embedded_replacement;
+#endif
+} App;
+
+static App app;
 
 static SDL_NORETURN void
 die(const char *fmt, ...)
@@ -132,8 +164,8 @@ die(const char *fmt, ...)
 	va_list ap;
 
 	fprintf(stderr, "bullet: ");
-	if (chat_context)
-		fprintf(stderr, "%s: ", chat_context);
+	if (app.chat_context)
+		fprintf(stderr, "%s: ", app.chat_context);
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
@@ -155,6 +187,12 @@ resize(void *p, size_t n, size_t size)
 
 	if (!size || n > MAX_MEMORY / size)
 		die("allocation limit exceeded");
+#ifdef BULLET_TEST
+	if (app.fail_next_resize) {
+		app.fail_next_resize = 0;
+		die("out of memory");
+	}
+#endif
 	q = realloc(p, n * size);
 	if (!q)
 		die("out of memory");
@@ -274,13 +312,13 @@ samefile(const char *a, const char *b)
 }
 
 static void
-check_destination(void)
+check_destination(const Options *options)
 {
 #ifdef _WIN32
 	wchar_t *w;
 	DWORD attr;
 
-	w = wide(opt.output);
+	w = wide(options->output);
 	attr = GetFileAttributesW(w);
 	SDL_free(w);
 	if (attr != INVALID_FILE_ATTRIBUTES &&
@@ -289,12 +327,13 @@ check_destination(void)
 #else
 	struct stat st;
 
-	if (!lstat(opt.output, &st) && !S_ISREG(st.st_mode))
+	if (!lstat(options->output, &st) && !S_ISREG(st.st_mode))
 		die("output must be a regular file");
 #endif
-	if (samefile(opt.output, opt.video) || samefile(opt.output, opt.chat))
+	if (samefile(options->output, options->video) ||
+	    samefile(options->output, options->chat))
 		die("output cannot be the source video or chat");
-	if (!opt.force && exists(opt.output))
+	if (!options->force && exists(options->output))
 		die("output exists; use another path or --force");
 }
 
@@ -324,33 +363,33 @@ commitfile(const char *from, const char *to, int replace)
 }
 
 static void
-surface_free(SDL_Surface *s)
+surface_free(Renderer *renderer, SDL_Surface *s)
 {
 	if (s) {
-		surface_bytes -= (size_t)s->pitch * s->h;
+		renderer->surface_bytes -= (size_t)s->pitch * s->h;
 		SDL_DestroySurface(s);
 	}
 }
 
 static void
-surface_limit(int width, int height)
+surface_limit(const Renderer *renderer, int width, int height)
 {
 	if (width < 1 || height < 1 || width > 65536 || height > 16000 ||
 	    (int64_t)width * height > MAX_PIXELS)
 		die("image dimensions exceed limit: %dx%d", width, height);
-	if ((size_t)width * height * 4 > MAX_MEMORY - surface_bytes)
+	if ((size_t)width * height * 4 > MAX_MEMORY - renderer->surface_bytes)
 		die("decoded image memory exceeds 512 MiB");
 }
 
 static SDL_Surface *
-surface(int width, int height)
+surface(Renderer *renderer, int width, int height)
 {
 	SDL_Surface *s;
 
-	surface_limit(width, height);
+	surface_limit(renderer, width, height);
 	s = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
 	check(s != NULL, "create RGBA surface");
-	surface_bytes += (size_t)s->pitch * s->h;
+	renderer->surface_bytes += (size_t)s->pitch * s->h;
 	return s;
 }
 
@@ -393,7 +432,7 @@ pack_runs(const SDL_Surface *s, unsigned char *data, size_t limit)
 /* Takes ownership. Keep dense pixels if packing cannot save memory or if
  * the temporary allocation would exceed the existing image budget. */
 static Sprite *
-sprite_create(SDL_Surface *pixels)
+sprite_create(Renderer *renderer, SDL_Surface *pixels)
 {
 	Sprite *s;
 	size_t limit, bytes;
@@ -402,12 +441,12 @@ sprite_create(SDL_Surface *pixels)
 	memset(s, 0, sizeof *s);
 	s->pixels = pixels;
 #ifdef BULLET_TEST
-	if (dense_reference)
+	if (renderer->dense_reference)
 		return s;
 #endif
 	limit = (size_t)pixels->pitch * pixels->h - 1;
-	if (limit > MAX_MEMORY - surface_bytes)
-		limit = MAX_MEMORY - surface_bytes;
+	if (limit > MAX_MEMORY - renderer->surface_bytes)
+		limit = MAX_MEMORY - renderer->surface_bytes;
 	bytes = pack_runs(pixels, NULL, limit);
 	if (bytes == NONE)
 		return s;
@@ -419,83 +458,91 @@ sprite_create(SDL_Surface *pixels)
 			die("sprite run sizes disagree");
 	}
 	s->bytes = bytes;
-	surface_bytes += bytes;
-	surface_free(pixels);
+	renderer->surface_bytes += bytes;
+	surface_free(renderer, pixels);
 	s->pixels = NULL;
 	return s;
 }
 
 static void
-sprite_free(Sprite *s)
+sprite_free(Renderer *renderer, Sprite *s)
 {
 	if (s) {
-		surface_free(s->pixels);
-		surface_bytes -= s->bytes;
+		surface_free(renderer, s->pixels);
+		renderer->surface_bytes -= s->bytes;
 		free(s->runs);
 		free(s);
 	}
 }
 
 static void
-freechat(void)
+freechat(Chat *chat, Renderer *renderer)
 {
 	size_t i, j;
 
-	for (i = 0; i < nmessages; i++) {
-		for (j = 0; j < messages[i].count; j++)
-			free(messages[i].parts[j].text);
-		free(messages[i].parts);
-		sprite_free(messages[i].sprite);
+	for (i = 0; i < chat->nmessages; i++) {
+		for (j = 0; j < chat->messages[i].count; j++)
+			free(chat->messages[i].parts[j].text);
+		free(chat->messages[i].parts);
+		sprite_free(renderer, chat->messages[i].sprite);
 	}
-	for (i = 0; i < nassets; i++) {
-		free(assets[i].url);
-		free(assets[i].embedded);
-		for (j = 0; j < assets[i].count; j++)
-			surface_free(assets[i].frames[j]);
-		free(assets[i].frames);
-		free(assets[i].ends);
+	for (i = 0; i < chat->nassets; i++) {
+		free(chat->assets[i].url);
+		free(chat->assets[i].embedded);
+		for (j = 0; j < chat->assets[i].count; j++)
+			surface_free(renderer, chat->assets[i].frames[j]);
+		free(chat->assets[i].frames);
+		free(chat->assets[i].ends);
 	}
-	free(messages);
-	free(assets);
-	messages = NULL;
-	assets = NULL;
-	nmessages = nassets = nparts = 0;
+	free(chat->messages);
+	free(chat->assets);
+	chat->messages = NULL;
+	chat->assets = NULL;
+	chat->nmessages = chat->nassets = chat->nparts = 0;
 }
 
 static int
-end_cache_stage(void)
+end_cache_stage(CacheStage *cache)
 {
-	if (cache_stage.payload && !SDL_RemovePath(cache_stage.payload) &&
-	    exists(cache_stage.payload))
+	if (cache->payload && !SDL_RemovePath(cache->payload) &&
+	    exists(cache->payload))
 		return 0;
-	if (cache_stage.directory && !SDL_RemovePath(cache_stage.directory))
+	if (cache->directory && !SDL_RemovePath(cache->directory))
 		return 0;
-	free(cache_stage.payload);
-	free(cache_stage.directory);
-	cache_stage.payload = cache_stage.directory = NULL;
+	free(cache->payload);
+	free(cache->directory);
+	cache->payload = cache->directory = NULL;
 	return 1;
 }
 
 static void
-endwork(void)
+endwork(OutputWork *work, CacheStage *cache)
 {
-	if (!end_cache_stage())
+	if (work->log) {
+		if (!SDL_CloseIO(work->log))
+			fprintf(stderr,
+				"bullet: cannot close private log: %s\n",
+				SDL_GetError());
+		work->log = NULL;
+	}
+	if (!end_cache_stage(cache))
 		fprintf(stderr,
 			"bullet: cannot remove private cache staging: %s\n",
-			cache_stage.directory);
-	if (asset_temp)
-		SDL_RemovePath(asset_temp);
-	if (stage)
-		SDL_RemovePath(stage);
-	if (logpath && !keep_log)
-		SDL_RemovePath(logpath);
-	if (workdir && !keep_log)
-		SDL_RemovePath(workdir);
-	free(asset_temp);
-	free(stage);
-	free(logpath);
-	free(workdir);
-	asset_temp = stage = logpath = workdir = NULL;
+			cache->directory);
+	if (work->asset_temp)
+		SDL_RemovePath(work->asset_temp);
+	if (work->stage)
+		SDL_RemovePath(work->stage);
+	if (work->logpath && !work->keep_log)
+		SDL_RemovePath(work->logpath);
+	if (work->directory && !work->keep_log)
+		SDL_RemovePath(work->directory);
+	free(work->asset_temp);
+	free(work->stage);
+	free(work->logpath);
+	free(work->directory);
+	work->asset_temp = work->stage = work->logpath = work->directory =
+	    NULL;
 }
 
 static void
@@ -503,20 +550,23 @@ cleanup(void)
 {
 	int status;
 
-	if (child) {
-		SDL_KillProcess(child, true);
-		SDL_WaitProcess(child, true, &status);
-		SDL_DestroyProcess(child);
-		child = NULL;
+	if (app.child) {
+		SDL_KillProcess(app.child, true);
+		SDL_WaitProcess(app.child, true, &status);
+		SDL_DestroyProcess(app.child);
+		app.child = NULL;
 	}
-	if (keep_log && logpath)
-		fprintf(stderr, "bullet: FFmpeg log: %s\n", logpath);
-	endwork();
-	freechat();
-	free(inferred_chat);
-	free(inferred_output);
-	surface_free(canvas);
-	TTF_CloseFont(font);
+	if (app.work.keep_log && app.work.logpath)
+		fprintf(stderr, "bullet: FFmpeg log: %s\n", app.work.logpath);
+	endwork(&app.work, &app.cache_stage);
+	freechat(&app.chat, &app.renderer);
+	free(app.inferred_chat);
+	free(app.inferred_output);
+	app.inferred_chat = app.inferred_output = NULL;
+	surface_free(&app.renderer, app.renderer.canvas);
+	app.renderer.canvas = NULL;
+	TTF_CloseFont(app.glyphs.font);
+	app.glyphs.font = NULL;
 	TTF_Quit();
 	curl_global_cleanup();
 	SDL_Quit();
@@ -551,16 +601,16 @@ private_directory(const char *dir)
 }
 
 static void
-beginwork(const char *destination)
+beginwork(OutputWork *work, const char *destination)
 {
 	char *dir;
 
 	dir = dirnameof(destination);
 	check(SDL_CreateDirectory(dir), "create output directory");
-	workdir = private_directory(dir);
+	work->directory = private_directory(dir);
 	free(dir);
-	asset_temp = format("%s/asset", workdir);
-	logpath = format("%s/ffmpeg.log", workdir);
+	work->asset_temp = format("%s/asset", work->directory);
+	work->logpath = format("%s/ffmpeg.log", work->directory);
 }
 
 static unsigned char *
@@ -637,7 +687,8 @@ append(Buffer *b, const void *data, size_t n)
 }
 
 static void
-spawn(const char *const *args, int input, int capture, SDL_IOStream *log)
+spawn(SDL_Process **child, const char *const *args, int input, int capture,
+      SDL_IOStream *log)
 {
 	SDL_PropertiesID props;
 
@@ -665,34 +716,34 @@ spawn(const char *const *args, int input, int capture, SDL_IOStream *log)
 			  props, SDL_PROP_PROCESS_CREATE_STDERR_POINTER, log),
 		      "set log");
 	}
-	child = SDL_CreateProcessWithProperties(props);
+	*child = SDL_CreateProcessWithProperties(props);
 	SDL_DestroyProperties(props);
-	if (!child)
+	if (!*child)
 		die("cannot start %s: %s", args[0], SDL_GetError());
 }
 
 static void
-waitchild(void)
+waitchild(SDL_Process **child)
 {
 	int status;
 
-	check(SDL_WaitProcess(child, true, &status), "wait for child");
-	SDL_DestroyProcess(child);
-	child = NULL;
+	check(SDL_WaitProcess(*child, true, &status), "wait for child");
+	SDL_DestroyProcess(*child);
+	*child = NULL;
 	if (status)
 		die("external command failed (exit %d)", status);
 }
 
 static char *
-capture(const char *const *args)
+capture(SDL_Process **child, const char *const *args)
 {
 	Buffer b = {NULL, 0, 0, 8 * 1024 * 1024};
 	unsigned char block[8192];
 	SDL_IOStream *io;
 	size_t n;
 
-	spawn(args, 0, 1, NULL);
-	io = SDL_GetProcessOutput(child);
+	spawn(child, args, 0, 1, NULL);
+	io = SDL_GetProcessOutput(*child);
 	check(io != NULL, "get child output");
 	for (;;) {
 		n = SDL_ReadIO(io, block, sizeof block);
@@ -706,7 +757,7 @@ capture(const char *const *args)
 			SDL_Delay(1);
 		}
 	}
-	waitchild();
+	waitchild(child);
 	return (char *)b.data;
 }
 
@@ -884,7 +935,7 @@ frame_ceiling(int64_t time, int num, int den)
 }
 
 static cJSON *
-probejson(const char *path)
+probejson(SDL_Process **child, const char *path)
 {
 	const char *args[] = {"ffprobe",      "-v",	  "error",
 			      "-max_alloc",   "67108864", "-show_streams",
@@ -893,7 +944,7 @@ probejson(const char *path)
 	char *text;
 	cJSON *root;
 
-	text = capture(args);
+	text = capture(child, args);
 	root = parsejson(text);
 	free(text);
 	return root;
@@ -912,7 +963,7 @@ video_stream(const cJSON *root)
 }
 
 static Video
-probe(const char *path)
+probe(SDL_Process **child, const char *path)
 {
 	cJSON *root;
 	const cJSON *s, *entry;
@@ -920,7 +971,7 @@ probe(const char *path)
 	Video v;
 	double w, h, a, b, angle;
 
-	root = probejson(path);
+	root = probejson(child, path);
 	s = video_stream(root);
 	w = number(field(s, "width"));
 	h = number(field(s, "height"));
@@ -961,7 +1012,7 @@ probe(const char *path)
 }
 
 static size_t
-asset(const char *url, double aspect)
+asset(Chat *chat, const char *url, double aspect)
 {
 	size_t i;
 
@@ -969,16 +1020,17 @@ asset(const char *url, double aspect)
 		die("invalid HTTPS emote URL");
 	if (!isfinite(aspect) || aspect <= 0 || aspect > 256)
 		die("emote count or aspect ratio exceeds limit");
-	for (i = 0; i < nassets; i++)
-		if (!strcmp(url, assets[i].url))
+	for (i = 0; i < chat->nassets; i++)
+		if (!strcmp(url, chat->assets[i].url))
 			return i;
-	if (nassets == MAX_ASSETS)
+	if (chat->nassets == MAX_ASSETS)
 		die("emote count or aspect ratio exceeds limit");
-	assets = resize(assets, nassets + 1, sizeof *assets);
-	memset(&assets[nassets], 0, sizeof *assets);
-	assets[nassets].url = copystr(url);
-	assets[nassets].aspect = aspect;
-	return nassets++;
+	chat->assets =
+	    resize(chat->assets, chat->nassets + 1, sizeof *chat->assets);
+	memset(&chat->assets[chat->nassets], 0, sizeof *chat->assets);
+	chat->assets[chat->nassets].url = copystr(url);
+	chat->assets[chat->nassets].aspect = aspect;
+	return chat->nassets++;
 }
 
 static double
@@ -1020,30 +1072,31 @@ twitch_url(const cJSON *id)
 }
 
 static Message *
-message(int64_t time)
+message(Chat *chat, int64_t time)
 {
 	Message *m;
 
-	if (time < 0 || time > MAX_TIME || nmessages == MAX_MESSAGES)
+	if (time < 0 || time > MAX_TIME || chat->nmessages == MAX_MESSAGES)
 		die("message count or time exceeds limit");
-	messages = resize(messages, nmessages + 1, sizeof *messages);
-	m = &messages[nmessages];
+	chat->messages = resize(chat->messages, chat->nmessages + 1,
+				sizeof *chat->messages);
+	m = &chat->messages[chat->nmessages];
 	memset(m, 0, sizeof *m);
 	m->time = time;
 	m->stamp = -1;
-	m->order = nmessages++;
+	m->order = chat->nmessages++;
 	return m;
 }
 
 static void
-part(Message *m, const char *text, size_t image)
+part(Chat *chat, Message *m, const char *text, size_t image)
 {
 	Part *p;
 	char *s;
 
 	if (!*text && image == NONE)
 		return;
-	if (strlen(text) > 32768 || ++nparts > MAX_PARTS)
+	if (strlen(text) > 32768 || ++chat->nparts > MAX_PARTS)
 		die("comment text or part count exceeds limit");
 	m->parts = resize(m->parts, m->count + 1, sizeof *m->parts);
 	p = &m->parts[m->count++];
@@ -1056,10 +1109,10 @@ part(Message *m, const char *text, size_t image)
 }
 
 static void
-read_twitch(const cJSON *root)
+read_twitch(Chat *chat, int hls, int64_t origin, const cJSON *root)
 {
 	const cJSON *item, *comments, *body, *fragments, *f, *id;
-	char *url;
+	char *url, *embedded;
 	size_t index;
 	Message *m;
 	int64_t time;
@@ -1070,45 +1123,52 @@ read_twitch(const cJSON *root)
 	cJSON_ArrayForEach (item,
 			    field(field(root, "embeddedData"), "firstParty")) {
 		url = twitch_url(field(item, "id"));
-		index = asset(url, aspectof(item));
+		index = asset(chat, url, aspectof(item));
 		free(url);
-		free(assets[index].embedded);
-		assets[index].embedded = copystr(string(field(item, "data")));
+#ifdef BULLET_TEST
+		if (app.fail_embedded_replacement) {
+			app.fail_embedded_replacement = 0;
+			app.fail_next_resize = 1;
+		}
+#endif
+		embedded = copystr(string(field(item, "data")));
+		free(chat->assets[index].embedded);
+		chat->assets[index].embedded = embedded;
 	}
 	cJSON_ArrayForEach (item, comments) {
 		time = microseconds(
 		    number(field(item, "content_offset_seconds")));
-		if (opt.hls) {
+		if (hls) {
 			time = rfc3339(string(field(item, "created_at"))) -
-			       opt.origin;
+			       origin;
 			if (time < 0)
 				die("comment precedes HLS start");
 		}
-		m = message(time);
+		m = message(chat, time);
 		body = field(item, "message");
 		if (!cJSON_IsObject(body))
 			die("missing Twitch message");
 		fragments = field(body, "fragments");
 		if (!cJSON_IsArray(fragments) || !fragments->child) {
-			part(m, string(field(body, "body")), NONE);
+			part(chat, m, string(field(body, "body")), NONE);
 			continue;
 		}
 		cJSON_ArrayForEach (f, fragments) {
 			id = field(field(f, "emoticon"), "emoticon_id");
 			if (id && !cJSON_IsNull(id)) {
 				url = twitch_url(id);
-				index = asset(url, 1);
+				index = asset(chat, url, 1);
 				free(url);
-				part(m, "", index);
+				part(chat, m, "", index);
 			} else {
-				part(m, string(field(f, "text")), NONE);
+				part(chat, m, string(field(f, "text")), NONE);
 			}
 		}
 	}
 }
 
 static void
-read_youtube(const cJSON *root)
+read_youtube(Chat *chat, int hls, const cJSON *root)
 {
 	const cJSON *replay, *a, *item, *body, *runs, *r, *emoji, *thumb;
 	const cJSON *best;
@@ -1116,7 +1176,7 @@ read_youtube(const cJSON *root)
 	int64_t time;
 	double width, best_width;
 
-	if (opt.hls)
+	if (hls)
 		die("--hls-start is only supported for Twitch chat");
 	replay = field(root, "replayChatItemAction");
 	if (!cJSON_IsObject(replay))
@@ -1135,18 +1195,18 @@ read_youtube(const cJSON *root)
 			     strcmp(item->string,
 				    "liveChatMembershipItemRenderer")))
 				continue;
-			m = message(time * 1000);
+			m = message(chat, time * 1000);
 			if (field(item, "timestampUsec"))
 				m->stamp =
 				    integer(field(item, "timestampUsec"));
 			body = field(item, "message");
 			runs = field(body, "runs");
 			if (!cJSON_IsArray(runs) || !runs->child)
-				part(m, string(field(body, "simpleText")),
-				     NONE);
+				part(chat, m,
+				     string(field(body, "simpleText")), NONE);
 			cJSON_ArrayForEach (r, runs) {
 				if (cJSON_IsString(field(r, "text"))) {
-					part(m, string(field(r, "text")),
+					part(chat, m, string(field(r, "text")),
 					     NONE);
 					continue;
 				}
@@ -1155,7 +1215,7 @@ read_youtube(const cJSON *root)
 					continue;
 				if (!cJSON_IsTrue(
 					field(emoji, "isCustomEmoji"))) {
-					part(m,
+					part(chat, m,
 					     string(field(emoji, "emojiId")),
 					     NONE);
 					continue;
@@ -1178,8 +1238,8 @@ read_youtube(const cJSON *root)
 				}
 				if (!best)
 					die("custom emoji has no image URL");
-				part(m, "",
-				     asset(string(field(best, "url")),
+				part(chat, m, "",
+				     asset(chat, string(field(best, "url")),
 					   aspectof(best)));
 			}
 		}
@@ -1209,7 +1269,7 @@ compare_integer(const void *a, const void *b)
 }
 
 static void
-readchat(const char *path)
+readchat(Chat *chat, int hls, int64_t origin, const char *path)
 {
 	unsigned char *data;
 	const char *p, *end;
@@ -1218,7 +1278,7 @@ readchat(const char *path)
 	int twitch;
 	int64_t *starts, start;
 
-	chat_context = path;
+	app.chat_context = path;
 	data = readfile(path, MAX_JSON, &length);
 	if (memchr(data, 0, length))
 		die("NUL byte in JSON input");
@@ -1229,9 +1289,9 @@ readchat(const char *path)
 	twitch = field(root, "comments") != NULL;
 	for (;;) {
 		if (twitch)
-			read_twitch(root);
+			read_twitch(chat, hls, origin, root);
 		else
-			read_youtube(root);
+			read_youtube(chat, hls, root);
 		cJSON_Delete(root);
 		p = end;
 		while (isspace((unsigned char)*p))
@@ -1249,12 +1309,13 @@ readchat(const char *path)
 	starts = NULL;
 	count = skipped = 0;
 	if (!twitch) {
-		starts = resize(NULL, nmessages + 1, sizeof *starts);
-		for (i = 0; i < nmessages; i++)
-			if (messages[i].time && messages[i].stamp >= 0 &&
-			    messages[i].count)
-				starts[count++] =
-				    messages[i].stamp - messages[i].time;
+		starts = resize(NULL, chat->nmessages + 1, sizeof *starts);
+		for (i = 0; i < chat->nmessages; i++)
+			if (chat->messages[i].time &&
+			    chat->messages[i].stamp >= 0 &&
+			    chat->messages[i].count)
+				starts[count++] = chat->messages[i].stamp -
+						  chat->messages[i].time;
 	}
 	start = 0;
 	if (count) {
@@ -1266,27 +1327,30 @@ readchat(const char *path)
 	}
 	free(starts);
 	j = 0;
-	for (i = 0; i < nmessages; i++) {
-		if (!messages[i].count ||
-		    (count && !messages[i].time &&
-		     (messages[i].stamp < 0 || messages[i].stamp < start))) {
-			if (messages[i].count)
+	for (i = 0; i < chat->nmessages; i++) {
+		if (!chat->messages[i].count ||
+		    (count && !chat->messages[i].time &&
+		     (chat->messages[i].stamp < 0 ||
+		      chat->messages[i].stamp < start))) {
+			if (chat->messages[i].count)
 				skipped++;
-			for (length = 0; length < messages[i].count; length++)
-				free(messages[i].parts[length].text);
-			free(messages[i].parts);
+			for (length = 0; length < chat->messages[i].count;
+			     length++)
+				free(chat->messages[i].parts[length].text);
+			free(chat->messages[i].parts);
 		} else {
-			messages[j++] = messages[i];
+			chat->messages[j++] = chat->messages[i];
 		}
 	}
-	nmessages = j;
-	if (!nmessages)
+	chat->nmessages = j;
+	if (!chat->nmessages)
 		die("no text or emoji messages found in replay chat");
-	qsort(messages, nmessages, sizeof *messages, compare_time);
+	qsort(chat->messages, chat->nmessages, sizeof *chat->messages,
+	      compare_time);
 	if (skipped)
 		fprintf(stderr, "bullet: skipped %zu pre-stream comments\n",
 			skipped);
-	chat_context = NULL;
+	app.chat_context = NULL;
 }
 
 static void
@@ -1395,14 +1459,15 @@ fetch(const char *url, size_t *length)
 }
 
 static void
-asset_frame(Asset *a, SDL_Surface *source, uint64_t delay_ms)
+asset_frame(Renderer *renderer, int emote_height, Asset *a,
+	    SDL_Surface *source, uint64_t delay_ms)
 {
 	SDL_Surface *rgba, *out;
 	int64_t end;
 
 	if (a->count == MAX_FRAMES || delay_ms > 86400000)
 		die("emote frame count or duration exceeds limit");
-	surface_limit(a->target_width, emote_height);
+	surface_limit(renderer, a->target_width, emote_height);
 	rgba = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
 	check(rgba != NULL, "convert emote pixels");
 	/* Own the resized pixels directly; no second surface and row copy. */
@@ -1413,7 +1478,7 @@ asset_frame(Asset *a, SDL_Surface *source, uint64_t delay_ms)
 		check(out != NULL, "resize emote");
 		SDL_DestroySurface(rgba);
 	}
-	surface_bytes += (size_t)out->pitch * out->h;
+	renderer->surface_bytes += (size_t)out->pitch * out->h;
 	a->frames = resize(a->frames, a->count + 1, sizeof *a->frames);
 	a->ends = resize(a->ends, a->count + 1, sizeof *a->ends);
 	end = a->count ? a->ends[a->count - 1] : 0;
@@ -1423,7 +1488,9 @@ asset_frame(Asset *a, SDL_Surface *source, uint64_t delay_ms)
 }
 
 static void
-load_asset(Asset *a, const char *directory)
+load_asset(Renderer *renderer, int emote_height, OutputWork *work,
+	   CacheStage *cache, SDL_Process **child, Asset *a,
+	   const char *directory)
 {
 	char hex[65], *path;
 	unsigned char *bytes;
@@ -1438,7 +1505,7 @@ load_asset(Asset *a, const char *directory)
 	Uint64 delay;
 	const char *verify[] = {
 	    "ffmpeg",	"-v",		"error", "-xerror",   "-max_alloc",
-	    "67108864", "-ignore_loop", "1",	 "-i",	      asset_temp,
+	    "67108864", "-ignore_loop", "1",	 "-i",	      work->asset_temp,
 	    "-an",	"-frames:v",	"501",	 "-fps_mode", "passthrough",
 	    "-f",	"null",		"-",	 NULL};
 
@@ -1455,8 +1522,8 @@ load_asset(Asset *a, const char *directory)
 		die("empty emote: %s", a->url);
 	/* Probe dimensions before allowing a codec to expand untrusted data.
 	 */
-	writefile(asset_temp, bytes, length);
-	metadata = probejson(asset_temp);
+	writefile(work->asset_temp, bytes, length);
+	metadata = probejson(child, work->asset_temp);
 	stream = video_stream(metadata);
 	width = number(field(stream, "width"));
 	height = number(field(stream, "height"));
@@ -1468,14 +1535,14 @@ load_asset(Asset *a, const char *directory)
 	isgif = IMG_isGIF(io);
 	if (isgif) {
 		/* SDL_image accepts some truncated GIFs as an ordinary EOF. */
-		spawn(verify, 0, 0, NULL);
-		waitchild();
+		spawn(child, verify, 0, 0, NULL);
+		waitchild(child);
 		decoder = IMG_CreateAnimationDecoder_IO(io, true, "GIF");
 		check(decoder != NULL, "open GIF decoder");
 		while (IMG_GetAnimationDecoderFrame(decoder, &frame, &delay)) {
 			if (frame->w != (int)width || frame->h != (int)height)
 				die("GIF canvas changed dimensions");
-			asset_frame(a, frame, delay);
+			asset_frame(renderer, emote_height, a, frame, delay);
 			SDL_DestroySurface(frame);
 		}
 		if (IMG_GetAnimationDecoderStatus(decoder) !=
@@ -1489,28 +1556,27 @@ load_asset(Asset *a, const char *directory)
 		check(frame != NULL, "decode emote");
 		if (frame->w != (int)width || frame->h != (int)height)
 			die("emote dimensions disagree with metadata");
-		asset_frame(a, frame, 100);
+		asset_frame(renderer, emote_height, a, frame, 100);
 		SDL_DestroySurface(frame);
 	}
 	if (!a->count)
 		die("emote has no frames: %s", a->url);
 	if (!cached) {
-		if (cache_stage.directory || cache_stage.payload)
+		if (cache->directory || cache->payload)
 			die("private cache stage is already active");
-		cache_stage.directory = private_directory(directory);
-		cache_stage.payload =
-		    format("%s/asset", cache_stage.directory);
-		writefile(cache_stage.payload, bytes, length);
-		if (!commitfile(cache_stage.payload, path, 0))
+		cache->directory = private_directory(directory);
+		cache->payload = format("%s/asset", cache->directory);
+		writefile(cache->payload, bytes, length);
+		if (!commitfile(cache->payload, path, 0))
 			die("cannot commit emote cache without overwriting: "
 			    "%s",
 			    path);
-		free(cache_stage.payload);
-		cache_stage.payload = NULL;
-		check(end_cache_stage(), "remove private cache staging");
+		free(cache->payload);
+		cache->payload = NULL;
+		check(end_cache_stage(cache), "remove private cache staging");
 	}
 	free(bytes);
-	SDL_RemovePath(asset_temp);
+	SDL_RemovePath(work->asset_temp);
 	free(path);
 }
 
@@ -1664,70 +1730,62 @@ paste_sprite(SDL_Surface *to, const Sprite *s, double x, int y)
 }
 
 static void
-openfont(int width, int height)
+openfont(Glyphs *glyphs, const char *requested_font, int width, int height)
 {
 	const char *path;
 	size_t i;
 
-	font_size = (int)round((double)(width < height ? width : height) / 22);
-	if (font_size < 16)
-		font_size = 16;
-	outline = (int)round(font_size * 1.2 / 28);
-	if (outline < 1)
-		outline = 1;
-	gap = (int)round(font_size * 5.0 / 28);
-	if (gap < 2)
-		gap = 2;
-	lane_height = (int)ceil(font_size * 1.5) + 2 * outline;
-	emote_height = lane_height - gap;
-	path = opt.font;
+	glyphs->font_size =
+	    (int)round((double)(width < height ? width : height) / 22);
+	if (glyphs->font_size < 16)
+		glyphs->font_size = 16;
+	glyphs->outline = (int)round(glyphs->font_size * 1.2 / 28);
+	if (glyphs->outline < 1)
+		glyphs->outline = 1;
+	glyphs->gap = (int)round(glyphs->font_size * 5.0 / 28);
+	if (glyphs->gap < 2)
+		glyphs->gap = 2;
+	glyphs->lane_height =
+	    (int)ceil(glyphs->font_size * 1.5) + 2 * glyphs->outline;
+	glyphs->emote_height = glyphs->lane_height - glyphs->gap;
+	path = requested_font;
 	for (i = 0; !path && i < sizeof fonts / sizeof *fonts; i++)
 		if (exists(fonts[i]))
 			path = fonts[i];
 	if (!path)
 		die("no usable font; specify --font");
 	check(TTF_Init(), "initialize font library");
-	font = TTF_OpenFont(path, (float)font_size);
-	check(font != NULL, "open font");
+	glyphs->font = TTF_OpenFont(path, (float)glyphs->font_size);
+	check(glyphs->font != NULL, "open font");
 }
 
-static size_t
-layout(int width, int height)
+static void
+measure(Chat *chat, const Glyphs *glyphs)
 {
-	size_t i, j, k, lanes, row, choice, fallbacks, count, best_count;
-	size_t *heads;
-	Message *m, *old;
+	size_t i, j;
+	Message *m;
 	Part *p;
 	Asset *a;
-	int text_height, position, safe;
-	double speed, old_speed, right, furthest, best, clearance,
-	    target_width;
+	int text_height, position;
+	double target_width;
 
-	lanes = (size_t)(height / lane_height);
-	if (!lanes)
-		lanes = 1;
-	heads = resize(NULL, lanes, sizeof *heads);
-	for (i = 0; i < lanes; i++)
-		heads[i] = NONE;
-	fallbacks = 0;
-	clearance = gap > font_size / 2 ? gap : font_size / 2;
-	for (i = 0; i < nmessages; i++) {
-		m = &messages[i];
+	for (i = 0; i < chat->nmessages; i++) {
+		m = &chat->messages[i];
 		position = 0;
 		for (j = 0; j < m->count; j++) {
 			p = &m->parts[j];
 			p->x = position;
 			if (p->asset == NONE) {
-				check(TTF_GetStringSize(font, p->text, 0,
-							&p->width,
+				check(TTF_GetStringSize(glyphs->font, p->text,
+							0, &p->width,
 							&text_height),
 				      "measure text");
-				p->width += 2 * outline;
+				p->width += 2 * glyphs->outline;
 			} else {
-				a = &assets[p->asset];
+				a = &chat->assets[p->asset];
 				if (!a->target_width) {
-					target_width =
-					    round(emote_height * a->aspect);
+					target_width = round(
+					    glyphs->emote_height * a->aspect);
 					if (target_width > 65530)
 						die("comment is too wide");
 					a->target_width =
@@ -1737,12 +1795,36 @@ layout(int width, int height)
 				}
 				p->width = a->target_width;
 			}
-			if (p->width < 0 || p->width > 65530 - position - gap)
+			if (p->width < 0 ||
+			    p->width > 65530 - position - glyphs->gap)
 				die("comment is too wide");
-			position += p->width + (j + 1 < m->count ? gap : 0);
+			position +=
+			    p->width + (j + 1 < m->count ? glyphs->gap : 0);
 		}
 		m->width = position;
-		speed = (width + (double)m->width) / opt.travel;
+	}
+}
+
+static size_t
+assign_lanes(Message *messages, size_t nmessages, int width, int height,
+	     int lane_height, double clearance, int64_t travel)
+{
+	size_t i, k, lanes, row, choice, fallbacks, count, best_count;
+	size_t *heads;
+	Message *m, *old;
+	int safe;
+	double speed, old_speed, right, furthest, best;
+
+	lanes = (size_t)(height / lane_height);
+	if (!lanes)
+		lanes = 1;
+	heads = resize(NULL, lanes, sizeof *heads);
+	for (i = 0; i < lanes; i++)
+		heads[i] = NONE;
+	fallbacks = 0;
+	for (i = 0; i < nmessages; i++) {
+		m = &messages[i];
+		speed = (width + (double)m->width) / travel;
 		choice = NONE;
 		best = HUGE_VAL;
 		best_count = SIZE_MAX;
@@ -1752,11 +1834,11 @@ layout(int width, int height)
 			count = 0;
 			for (k = heads[row]; k != NONE; k = old->next) {
 				old = &messages[k];
-				if (old->time + opt.travel <= m->time)
+				if (old->time + travel <= m->time)
 					break;
 				count++;
 				old_speed =
-				    (width + (double)old->width) / opt.travel;
+				    (width + (double)old->width) / travel;
 				right = width -
 					old_speed * (m->time - old->time) +
 					old->width;
@@ -1764,7 +1846,7 @@ layout(int width, int height)
 					furthest = right;
 				if (right > width - clearance ||
 				    (old_speed < speed &&
-				     width - speed * (old->time + opt.travel -
+				     width - speed * (old->time + travel -
 						      m->time) <
 					 clearance))
 					safe = 0;
@@ -1791,11 +1873,11 @@ layout(int width, int height)
 }
 
 static SDL_Surface *
-text_surface(const char *text, SDL_Color color)
+text_surface(const Glyphs *glyphs, const char *text, SDL_Color color)
 {
 	SDL_Surface *s, *rgba;
 
-	s = TTF_RenderText_Blended(font, text, 0, color);
+	s = TTF_RenderText_Blended(glyphs->font, text, 0, color);
 	check(s != NULL, "rasterize text");
 	rgba = SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32);
 	SDL_DestroySurface(s);
@@ -1804,7 +1886,8 @@ text_surface(const char *text, SDL_Color color)
 }
 
 static void
-bake(Message *m)
+bake(const Chat *chat, const Glyphs *glyphs, Renderer *renderer, int shadow,
+     Message *m)
 {
 	SDL_Color white = {255, 255, 255, 255}, black = {0, 0, 0, 255};
 	SDL_Surface *fill, *edge, *image, *pixels;
@@ -1812,42 +1895,47 @@ bake(Message *m)
 	size_t j;
 	int y, dx, dy;
 
-	pixels = surface(m->width + 2, lane_height);
+	pixels = surface(renderer, m->width + 2, glyphs->lane_height);
 	for (j = 0; j < m->count; j++) {
 		p = &m->parts[j];
 		if (p->asset != NONE) {
-			if (assets[p->asset].count == 1) {
-				image = assets[p->asset].frames[0];
+			if (chat->assets[p->asset].count == 1) {
+				image = chat->assets[p->asset].frames[0];
 				paste(pixels, image, p->x,
-				      (lane_height - image->h) / 2);
+				      (glyphs->lane_height - image->h) / 2);
 			}
 			continue;
 		}
-		fill = text_surface(p->text, white);
-		y = (lane_height - fill->h) / 2;
-		if (opt.shadow) {
-			edge = text_surface(p->text, black);
+		fill = text_surface(glyphs, p->text, white);
+		y = (glyphs->lane_height - fill->h) / 2;
+		if (shadow) {
+			edge = text_surface(glyphs, p->text, black);
 			for (dy = -2; dy <= 2; dy += 4)
 				for (dx = -2; dx <= 2; dx += 4)
 					paste(pixels, edge,
-					      p->x + outline + dx, y + dy);
+					      p->x + glyphs->outline + dx,
+					      y + dy);
 		} else {
-			check(TTF_SetFontOutline(font, outline),
-			      "set outline");
-			edge = text_surface(p->text, black);
-			check(TTF_SetFontOutline(font, 0), "reset outline");
-			paste(pixels, edge, p->x, y - outline);
+			check(
+			    TTF_SetFontOutline(glyphs->font, glyphs->outline),
+			    "set outline");
+			edge = text_surface(glyphs, p->text, black);
+			check(TTF_SetFontOutline(glyphs->font, 0),
+			      "reset outline");
+			paste(pixels, edge, p->x, y - glyphs->outline);
 		}
-		paste(pixels, fill, p->x + outline, y);
+		paste(pixels, fill, p->x + glyphs->outline, y);
 		SDL_DestroySurface(fill);
 		SDL_DestroySurface(edge);
 	}
-	m->sprite = sprite_create(pixels);
+	m->sprite = sprite_create(renderer, pixels);
 }
 
 static void
-drawframe(int64_t now, size_t first, size_t last, int top)
+drawframe(Chat *chat, const Glyphs *glyphs, Renderer *renderer, int64_t now,
+	  size_t first, size_t last, int top)
 {
+	const RenderPlan *plan = &renderer->plan;
 	Message *m;
 	Part *p;
 	SDL_Surface *image;
@@ -1856,73 +1944,82 @@ drawframe(int64_t now, size_t first, size_t last, int top)
 	double x;
 	unsigned char *pixels;
 
-	memset(canvas->pixels, 0, (size_t)canvas->pitch * canvas->h);
+	memset(renderer->canvas->pixels, 0,
+	       (size_t)renderer->canvas->pitch * renderer->canvas->h);
 	for (i = first; i < last; i++) {
-		m = &messages[i];
-		x = canvas->w - (canvas->w + (double)m->width) *
-				    (now - m->time) / opt.travel;
-		if (x >= canvas->w || x + m->width <= 0)
+		m = &chat->messages[i];
+		x = renderer->canvas->w -
+		    (renderer->canvas->w + (double)m->width) *
+			(now - m->time) / plan->travel;
+		if (x >= renderer->canvas->w || x + m->width <= 0)
 			continue;
 		if (!m->sprite)
-			bake(m);
-		paste_sprite(canvas, m->sprite, x, m->y - top);
+			bake(chat, glyphs, renderer, plan->shadow, m);
+		paste_sprite(renderer->canvas, m->sprite, x, m->y - top);
 		for (j = 0; j < m->count; j++) {
 			p = &m->parts[j];
-			if (p->asset == NONE || assets[p->asset].count == 1)
+			if (p->asset == NONE ||
+			    chat->assets[p->asset].count == 1)
 				continue;
-			image = frame_at(&assets[p->asset], now - m->time);
-			paste(canvas, image, x + p->x,
-			      m->y - top + (lane_height - image->h) / 2);
+			image =
+			    frame_at(&chat->assets[p->asset], now - m->time);
+			paste(renderer->canvas, image, x + p->x,
+			      m->y - top +
+				  (glyphs->lane_height - image->h) / 2);
 		}
 	}
-	if (opt.opacity == 100)
+	if (plan->opacity == 100)
 		return;
-	for (row = 0; row < canvas->h; row++) {
-		pixels = (unsigned char *)canvas->pixels + row * canvas->pitch;
-		for (column = 0; column < canvas->w; column++)
+	for (row = 0; row < renderer->canvas->h; row++) {
+		pixels = (unsigned char *)renderer->canvas->pixels +
+			 row * renderer->canvas->pitch;
+		for (column = 0; column < renderer->canvas->w; column++)
 			pixels[column * 4 + 3] =
 			    (unsigned char)((pixels[column * 4 + 3] *
-						 opt.opacity +
+						 plan->opacity +
 					     50) /
 					    100);
 	}
 }
 
 static Overlay
-overlay_plan(int height)
+overlay_plan(Chat *chat, const RenderPlan *plan, int lane_height)
 {
 	Overlay o = {0};
-	int bottom;
+	int bottom, height = plan->height;
 	int64_t begin, end, stop;
 	size_t i, j;
 	Message *m;
 
-	stop = opt.start + opt.duration;
+	stop = plan->start + plan->duration;
 	begin = stop;
-	end = opt.start;
+	end = plan->start;
 	o.y = height;
 	bottom = 0;
-	for (i = 0; i < nmessages; i++) {
-		m = &messages[i];
-		if (m->time >= stop || m->time + opt.travel <= opt.start)
+	for (i = 0; i < chat->nassets; i++)
+		chat->assets[i].needed = 0;
+	for (i = 0; i < chat->nmessages; i++) {
+		m = &chat->messages[i];
+		if (m->time >= stop || m->time + plan->travel <= plan->start)
 			continue;
 		o.visible++;
 		if (m->time < begin)
 			begin = m->time;
-		if (m->time + opt.travel > end)
-			end = m->time + opt.travel;
+		if (m->time + plan->travel > end)
+			end = m->time + plan->travel;
 		if (m->y < o.y)
 			o.y = m->y;
 		if (m->y + lane_height > bottom)
 			bottom = m->y + lane_height;
 		for (j = 0; j < m->count; j++)
 			if (m->parts[j].asset != NONE)
-				assets[m->parts[j].asset].needed = 1;
+				chat->assets[m->parts[j].asset].needed = 1;
 	}
 	if (end > stop)
 		end = stop;
-	o.first = frame_ceiling(begin - opt.start, opt.fps_num, opt.fps_den);
-	o.end = frame_ceiling(end - opt.start, opt.fps_num, opt.fps_den);
+	o.first =
+	    frame_ceiling(begin - plan->start, plan->fps_num, plan->fps_den);
+	o.end = frame_ceiling(end - plan->start, plan->fps_num, plan->fps_den);
 	o.height = (bottom < height ? bottom : height) - o.y;
 	if (o.first >= o.end) {
 		/* A single transparent frame keeps the same RGB filter
@@ -1936,13 +2033,13 @@ overlay_plan(int height)
 }
 
 static void
-check_names(void)
+check_names(const Options *options)
 {
 	const char *video, *chat, *dot;
 	size_t n, length;
 
-	video = basenameof(opt.video);
-	chat = basenameof(opt.chat);
+	video = basenameof(options->video);
+	chat = basenameof(options->chat);
 	dot = strrchr(video, '.');
 	n = dot ? (size_t)(dot - video) : strlen(video);
 	length = strlen(chat);
@@ -1956,8 +2053,38 @@ check_names(void)
 		die("video/chat IDs do not match");
 }
 
+static RenderPlan
+resolve_plan(const Options *options, const Video *video)
+{
+	RenderPlan plan;
+
+	if (options->start >= video->duration)
+		die("--start is past the video end");
+	plan.start = options->start;
+	plan.duration = options->duration;
+	if (plan.duration < 0 || plan.duration > video->duration - plan.start)
+		plan.duration = video->duration - plan.start;
+	plan.height = options->height ? options->height : video->height;
+	plan.width = options->height
+			 ? (int)(2 * round((double)video->width * plan.height /
+					   video->height / 2))
+			 : video->width;
+	if (plan.width < 2 || plan.width > 16000 || plan.height < 2 ||
+	    plan.height > 16000 || plan.width % 2 || plan.height % 2 ||
+	    (int64_t)plan.width * plan.height > MAX_PIXELS)
+		die("output dimensions must be even and within the pixel "
+		    "limit");
+	plan.fps_num = options->fps_num ? options->fps_num : video->fps_num;
+	plan.fps_den = options->fps_num ? options->fps_den : video->fps_den;
+	plan.travel = options->travel;
+	plan.opacity = options->opacity;
+	plan.shadow = options->shadow;
+	return plan;
+}
+
 static void
-render(void)
+render(const Options *options, Chat *chat, Glyphs *glyphs, Renderer *renderer,
+       OutputWork *work, CacheStage *cache, SDL_Process **child)
 {
 	Video v;
 	Overlay overlay;
@@ -1973,7 +2100,7 @@ render(void)
 			      "-ss",
 			      start,
 			      "-i",
-			      opt.video,
+			      options->video,
 			      "-f",
 			      "rawvideo",
 			      "-pixel_format",
@@ -2006,76 +2133,71 @@ render(void)
 			      "+faststart",
 			      NULL,
 			      NULL};
-	SDL_IOStream *log, *input;
-	int width, height, row, blank;
+	const RenderPlan *plan = &renderer->plan;
+	SDL_IOStream *input;
+	int width, height, row, blank, closed;
 	int64_t now, n;
 	Uint64 started, reported, ticks;
 	double elapsed;
 	size_t i, first, last, fallbacks;
 
 	started = reported = SDL_GetTicks();
-	fprintf(stderr, "bullet: video: %s\n", opt.video);
-	fprintf(stderr, "bullet: chat: %s\n", opt.chat);
-	fprintf(stderr, "bullet: output: %s\n", opt.output);
-	check_destination();
-	check_names();
-	v = probe(opt.video);
-	if (opt.start >= v.duration)
-		die("--start is past the video end");
-	if (opt.duration < 0 || opt.duration > v.duration - opt.start)
-		opt.duration = v.duration - opt.start;
-	height = opt.height ? opt.height : v.height;
-	width = opt.height
-		    ? (int)(2 * round((double)v.width * height / v.height / 2))
-		    : v.width;
-	if (width < 2 || width > 16000 || height < 2 || height > 16000 ||
-	    width % 2 || height % 2 || (int64_t)width * height > MAX_PIXELS)
-		die("output dimensions must be even and within the pixel "
-		    "limit");
-	if (!opt.fps_num) {
-		opt.fps_num = v.fps_num;
-		opt.fps_den = v.fps_den;
-	}
+	fprintf(stderr, "bullet: video: %s\n", options->video);
+	fprintf(stderr, "bullet: chat: %s\n", options->chat);
+	fprintf(stderr, "bullet: output: %s\n", options->output);
+	check_destination(options);
+	check_names(options);
+	v = probe(child, options->video);
+	renderer->plan = resolve_plan(options, &v);
+	width = plan->width;
+	height = plan->height;
 	fprintf(stderr, "bullet: reading chat\n");
-	readchat(opt.chat);
-	fprintf(stderr, "bullet: laying out %zu messages\n", nmessages);
-	openfont(width, height);
-	fallbacks = layout(width, height);
-	beginwork(opt.output);
-	extension = strrchr(basenameof(opt.output), '.');
+	readchat(chat, options->hls, options->origin, options->chat);
+	fprintf(stderr, "bullet: laying out %zu messages\n", chat->nmessages);
+	openfont(glyphs, options->font, width, height);
+	measure(chat, glyphs);
+	fallbacks = assign_lanes(chat->messages, chat->nmessages, width,
+				 height, glyphs->lane_height,
+				 glyphs->gap > glyphs->font_size / 2
+				     ? glyphs->gap
+				     : glyphs->font_size / 2,
+				 plan->travel);
+	beginwork(work, options->output);
+	extension = strrchr(basenameof(options->output), '.');
 	if (!extension || !extension[1])
 		die("output must have a video extension");
-	stage = format("%s/video%s", workdir, extension);
-	parent = dirnameof(opt.chat);
+	work->stage = format("%s/video%s", work->directory, extension);
+	parent = dirnameof(options->chat);
 	directory = format("%s/assets", parent);
 	free(parent);
-	overlay = overlay_plan(height);
+	overlay = overlay_plan(chat, plan, glyphs->lane_height);
 #ifdef BULLET_TEST
 	/* Test-only oracle: the original full-frame, full-duration stream. */
-	if (dense_reference) {
+	if (renderer->dense_reference) {
 		overlay.y = 0;
 		overlay.height = height;
 		overlay.first = 0;
-		overlay.end =
-		    frame_ceiling(opt.duration, opt.fps_num, opt.fps_den);
+		overlay.end = frame_ceiling(plan->duration, plan->fps_num,
+					    plan->fps_den);
 	}
 #endif
 	fprintf(stderr, "bullet: preparing visible images and GIFs\n");
-	for (i = 0; i < nassets; i++) {
-		if (assets[i].needed) {
+	for (i = 0; i < chat->nassets; i++) {
+		if (chat->assets[i].needed) {
 			check(SDL_CreateDirectory(directory),
 			      "create asset cache");
-			load_asset(&assets[i], directory);
+			load_asset(renderer, glyphs->emote_height, work, cache,
+				   child, &chat->assets[i], directory);
 		}
 	}
 	free(directory);
-	canvas = surface(width, overlay.height);
-	snprintf(fps, sizeof fps, "%d/%d", opt.fps_num, opt.fps_den);
+	renderer->canvas = surface(renderer, width, overlay.height);
+	snprintf(fps, sizeof fps, "%d/%d", plan->fps_num, plan->fps_den);
 	snprintf(dimensions, sizeof dimensions, "%dx%d", width,
 		 overlay.height);
-	snprintf(start, sizeof start, "%.6f", (double)opt.start / SECOND);
+	snprintf(start, sizeof start, "%.6f", (double)plan->start / SECOND);
 	snprintf(duration, sizeof duration, "%.6f",
-		 (double)opt.duration / SECOND);
+		 (double)plan->duration / SECOND);
 	/* Even transparent chat used the YUV -> RGB -> YUV round trip.
 	 * Keep that negotiation, not a YUV overlay or a direct base bypass.
 	 * Rawvideo PTS units are whole CFR frames, so the offset is exact. */
@@ -2085,17 +2207,19 @@ render(void)
 		 "[base][chat]overlay=0:%d:format=auto:"
 		 "eof_action=pass:repeatlast=0,format=yuv420p[v]",
 		 fps, width, height, (long long)overlay.first, overlay.y);
-	args[sizeof args / sizeof *args - 2] = stage;
+	args[sizeof args / sizeof *args - 2] = work->stage;
 	/* Seeking at zero discards AAC priming packets; do not seek a full
 	 * VOD. */
-	if (!opt.start)
+	if (!plan->start)
 		memmove(args + 6, args + 8, sizeof args - 8 * sizeof *args);
-	log = SDL_IOFromFile(logpath, "wb");
-	check(log != NULL, "create private FFmpeg log");
-	keep_log = 1;
-	spawn(args, 1, 0, log);
-	check(SDL_CloseIO(log), "close parent log handle");
-	input = SDL_GetProcessInput(child);
+	work->log = SDL_IOFromFile(work->logpath, "wb");
+	check(work->log != NULL, "create private FFmpeg log");
+	work->keep_log = 1;
+	spawn(child, args, 1, 0, work->log);
+	closed = SDL_CloseIO(work->log);
+	work->log = NULL;
+	check(closed, "close parent log handle");
+	input = SDL_GetProcessInput(*child);
 	check(input != NULL, "get FFmpeg input");
 	fprintf(stderr,
 		"bullet: %dx%d, %s fps, %zu visible messages, "
@@ -2104,33 +2228,38 @@ render(void)
 	first = last = 0;
 	blank = 1;
 	for (n = overlay.first; n < overlay.end; n++) {
-		now = opt.start + frame_time(n, opt.fps_num, opt.fps_den);
-		while (last < nmessages && messages[last].time <= now)
+		now =
+		    plan->start + frame_time(n, plan->fps_num, plan->fps_den);
+		while (last < chat->nmessages &&
+		       chat->messages[last].time <= now)
 			last++;
 		while (first < last &&
-		       messages[first].time + opt.travel <= now) {
-			sprite_free(messages[first].sprite);
-			messages[first++].sprite = NULL;
+		       chat->messages[first].time + plan->travel <= now) {
+			sprite_free(renderer, chat->messages[first].sprite);
+			chat->messages[first++].sprite = NULL;
 		}
 #ifdef BULLET_TEST
-		if (dense_reference)
+		if (renderer->dense_reference)
 			blank = 0;
 #endif
 		/* Reuse transparent pixels across internal gaps. The pipe is
 		 * CFR, so gaps inside the transmitted interval still need
 		 * frames. */
 		if (first != last || !blank)
-			drawframe(now, first, last, overlay.y);
+			drawframe(chat, glyphs, renderer, now, first, last,
+				  overlay.y);
 		blank = first == last;
-		if (canvas->pitch == width * 4) {
-			writeall(input, canvas->pixels,
-				 (size_t)canvas->pitch * canvas->h);
+		if (renderer->canvas->pitch == width * 4) {
+			writeall(input, renderer->canvas->pixels,
+				 (size_t)renderer->canvas->pitch *
+				     renderer->canvas->h);
 		} else {
-			for (row = 0; row < canvas->h; row++)
-				writeall(input,
-					 (unsigned char *)canvas->pixels +
-					     row * canvas->pitch,
-					 (size_t)width * 4);
+			for (row = 0; row < renderer->canvas->h; row++)
+				writeall(
+				    input,
+				    (unsigned char *)renderer->canvas->pixels +
+					row * renderer->canvas->pitch,
+				    (size_t)width * 4);
 		}
 		ticks = SDL_GetTicks();
 		if (ticks - reported >= 10000) {
@@ -2140,10 +2269,10 @@ render(void)
 			    "bullet: progress frame=%lld time=%.3f/%.3f "
 			    "wall=%.1fs speed=%.2fx rgba=%.1fMiB active=%zu\n",
 			    (long long)(n + 1),
-			    (double)(now - opt.start) / SECOND,
-			    (double)opt.duration / SECOND, elapsed,
-			    (double)(now - opt.start) / SECOND / elapsed,
-			    (double)surface_bytes / (1024 * 1024),
+			    (double)(now - plan->start) / SECOND,
+			    (double)plan->duration / SECOND, elapsed,
+			    (double)(now - plan->start) / SECOND / elapsed,
+			    (double)renderer->surface_bytes / (1024 * 1024),
 			    last - first);
 			reported = ticks;
 		}
@@ -2151,13 +2280,13 @@ render(void)
 	fprintf(stderr, "bullet: submitted %lld frames; waiting for FFmpeg\n",
 		(long long)(n - overlay.first));
 	check(SDL_CloseIO(input), "close FFmpeg input");
-	waitchild();
-	check_destination();
-	if (!commitfile(stage, opt.output, opt.force))
+	waitchild(child);
+	check_destination(options);
+	if (!commitfile(work->stage, options->output, options->force))
 		die("cannot commit output; existing files were not removed");
-	keep_log = 0;
-	endwork();
-	fprintf(stderr, "bullet: rendered %s\n", opt.output);
+	work->keep_log = 0;
+	endwork(work, cache);
+	fprintf(stderr, "bullet: rendered %s\n", options->output);
 }
 
 static const char *
@@ -2170,7 +2299,8 @@ executable(const char *variable, const char *fallback)
 }
 
 static void
-download(void)
+download(const Options *options, Chat *scene, Renderer *renderer,
+	 OutputWork *work, CacheStage *cache, SDL_Process **child)
 {
 	CURLU *url;
 	char *host, *scheme, *path, *id, *chat, *video, *output, *p, *last;
@@ -2181,7 +2311,7 @@ download(void)
 	int twitch;
 
 	url = curl_url();
-	if (!url || curl_url_set(url, CURLUPART_URL, opt.url, 0) ||
+	if (!url || curl_url_set(url, CURLUPART_URL, options->url, 0) ||
 	    curl_url_get(url, CURLUPART_SCHEME, &scheme, 0) ||
 	    curl_url_get(url, CURLUPART_HOST, &host, 0) ||
 	    curl_url_get(url, CURLUPART_PATH, &path, 0))
@@ -2213,42 +2343,43 @@ download(void)
 	curl_free(host);
 	curl_free(path);
 	curl_url_cleanup(url);
-	check(SDL_CreateDirectory(opt.dir), "create download directory");
+	check(SDL_CreateDirectory(options->dir), "create download directory");
 	if (twitch) {
-		chat = format("%s/v%s.chat.json", opt.dir, id);
+		chat = format("%s/v%s.chat.json", options->dir, id);
 		if (!exists(chat)) {
-			beginwork(chat);
-			stage = format("%s/chat.json", workdir);
+			beginwork(work, chat);
+			work->stage = format("%s/chat.json", work->directory);
 			args[0] = executable("TWITCH_DOWNLOADER_CLI",
 					     "TwitchDownloaderCLI");
 			args[1] = "chatdownload";
 			args[2] = "--id";
 			args[3] = id;
 			args[4] = "--output";
-			args[5] = stage;
+			args[5] = work->stage;
 			args[6] = "--embed-images";
 			args[7] = "--collision";
 			args[8] = "Exit";
 			args[9] = NULL;
-			spawn(args, 0, 0, NULL);
-			waitchild();
-			readchat(stage);
-			freechat();
-			if (!commitfile(stage, chat, 0))
+			spawn(child, args, 0, 0, NULL);
+			waitchild(child);
+			readchat(scene, options->hls, options->origin,
+				 work->stage);
+			freechat(scene, renderer);
+			if (!commitfile(work->stage, chat, 0))
 				die("cannot commit chat without overwriting "
 				    "%s",
 				    chat);
-			endwork();
+			endwork(work, cache);
 		} else {
-			readchat(chat);
-			freechat();
+			readchat(scene, options->hls, options->origin, chat);
+			freechat(scene, renderer);
 		}
 		free(chat);
 		for (i = 0; i < sizeof extensions / sizeof *extensions; i++) {
-			video =
-			    format("%s/v%s.%s", opt.dir, id, extensions[i]);
+			video = format("%s/v%s.%s", options->dir, id,
+				       extensions[i]);
 			if (exists(video)) {
-				probe(video);
+				probe(child, video);
 				fprintf(stderr, "bullet: reusing %s\n", video);
 				free(video);
 				free(id);
@@ -2260,7 +2391,8 @@ download(void)
 	snprintf(selection, sizeof selection,
 		 "bv[height<=%d][ext=mp4]+ba[ext=m4a]/bv[height<=%d]+ba/"
 		 "b[height<=%d]",
-		 opt.max_height, opt.max_height, opt.max_height);
+		 options->max_height, options->max_height,
+		 options->max_height);
 	n = 0;
 	args[n++] = executable("YT_DLP", "yt-dlp");
 	args[n++] = "--no-playlist";
@@ -2277,12 +2409,12 @@ download(void)
 	args[n++] = "-f";
 	args[n++] = selection;
 	args[n++] = "-P";
-	args[n++] = opt.dir;
+	args[n++] = options->dir;
 	args[n++] = "-o";
 	args[n++] = "%(id)s.%(ext)s";
-	args[n++] = opt.url;
+	args[n++] = options->url;
 	args[n] = NULL;
-	output = capture(args);
+	output = capture(child, args);
 	last = NULL;
 	for (p = output; *p;) {
 		video = p;
@@ -2295,20 +2427,21 @@ download(void)
 	}
 	if (!last)
 		die("yt-dlp returned no output path");
-	video = exists(last) ? copystr(last) : format("%s/%s", opt.dir, last);
-	probe(video);
+	video =
+	    exists(last) ? copystr(last) : format("%s/%s", options->dir, last);
+	probe(child, video);
 	if (twitch) {
-		chat = format("%s/v%s.chat.json", opt.dir, id);
+		chat = format("%s/v%s.chat.json", options->dir, id);
 	} else {
 		p = copystr(basenameof(video));
 		last = strrchr(p, '.');
 		if (last)
 			*last = 0;
-		chat = format("%s/%s.live_chat.json", opt.dir, p);
+		chat = format("%s/%s.live_chat.json", options->dir, p);
 		free(p);
 	}
-	readchat(chat);
-	freechat();
+	readchat(scene, options->hls, options->origin, chat);
+	freechat(scene, renderer);
 	fprintf(stderr, "bullet: downloaded %s\n", video);
 	free(chat);
 	free(video);
@@ -2356,19 +2489,19 @@ usage(void)
 }
 
 static void
-render_paths(void)
+render_paths(Options *options, char **inferred_chat, char **inferred_output)
 {
 	const char *name, *dot;
 	char *stem, *twitch, *youtube;
 	int has_twitch, has_youtube;
 
-	name = basenameof(opt.video);
+	name = basenameof(options->video);
 	dot = strrchr(name, '.');
 	if (!dot || dot == name)
 		die("cannot infer paths: VIDEO has no extension");
-	stem = copystr(opt.video);
-	stem[dot - opt.video] = 0;
-	if (!opt.chat) {
+	stem = copystr(options->video);
+	stem[dot - options->video] = 0;
+	if (!options->chat) {
 		twitch = format("%s.chat.json", stem);
 		youtube = format("%s.live_chat.json", stem);
 		has_twitch = exists(twitch);
@@ -2377,29 +2510,30 @@ render_paths(void)
 			die(has_twitch
 				? "both chat formats exist; specify CHAT"
 				: "no chat beside VIDEO; specify CHAT");
-		inferred_chat = has_twitch ? twitch : youtube;
+		*inferred_chat = has_twitch ? twitch : youtube;
 		free(has_twitch ? youtube : twitch);
-		opt.chat = inferred_chat;
+		options->chat = *inferred_chat;
 	}
-	if (!opt.output) {
-		inferred_output = format("%s.bullet.mp4", stem);
-		opt.output = inferred_output;
+	if (!options->output) {
+		*inferred_output = format("%s.bullet.mp4", stem);
+		options->output = *inferred_output;
 	}
 	free(stem);
 }
 
 static int
-arguments(int argc, char **argv)
+arguments(Options *options, char **inferred_chat, char **inferred_output,
+	  int argc, char **argv)
 {
 	const char *key, *value;
 	int i, mode;
 
-	memset(&opt, 0, sizeof opt);
-	opt.duration = -1;
-	opt.travel = default_travel;
-	opt.opacity = default_opacity;
-	opt.dir = "data";
-	opt.max_height = 720;
+	memset(options, 0, sizeof *options);
+	options->duration = -1;
+	options->travel = default_travel;
+	options->opacity = default_opacity;
+	options->dir = "data";
+	options->max_height = 720;
 	if (argc < 2)
 		die("expected download or render; use --help");
 	mode = !strcmp(argv[1], "download") ? 1
@@ -2410,16 +2544,16 @@ arguments(int argc, char **argv)
 	for (i = 2; i < argc; i++) {
 		key = argv[i];
 		if (!strcmp(key, "--force") && mode == 2) {
-			opt.force = 1;
+			options->force = 1;
 			continue;
 		}
 		if (*key != '-') {
-			if (mode == 1 && !opt.url)
-				opt.url = key;
-			else if (mode == 2 && !opt.video)
-				opt.video = key;
-			else if (mode == 2 && !opt.chat)
-				opt.chat = key;
+			if (mode == 1 && !options->url)
+				options->url = key;
+			else if (mode == 2 && !options->video)
+				options->video = key;
+			else if (mode == 2 && !options->chat)
+				options->chat = key;
 			else
 				die("unexpected argument: %s", key);
 			continue;
@@ -2428,42 +2562,43 @@ arguments(int argc, char **argv)
 			die("missing value for %s", key);
 		value = argv[++i];
 		if (mode == 1 && !strcmp(key, "--dir"))
-			opt.dir = value;
+			options->dir = value;
 		else if (mode == 1 && !strcmp(key, "--max-height"))
-			opt.max_height = argument_int(value, 1, 16000);
+			options->max_height = argument_int(value, 1, 16000);
 		else if (mode == 2 && !strcmp(key, "--output"))
-			opt.output = value;
+			options->output = value;
 		else if (mode == 2 && !strcmp(key, "--font"))
-			opt.font = value;
+			options->font = value;
 		else if (mode == 2 && !strcmp(key, "--start"))
-			opt.start = microseconds(argument_number(value));
+			options->start = microseconds(argument_number(value));
 		else if (mode == 2 && !strcmp(key, "--duration"))
-			opt.duration = microseconds(argument_number(value));
+			options->duration =
+			    microseconds(argument_number(value));
 		else if (mode == 2 && !strcmp(key, "--travel-time"))
-			opt.travel = microseconds(argument_number(value));
+			options->travel = microseconds(argument_number(value));
 		else if (mode == 2 && !strcmp(key, "--opacity"))
-			opt.opacity = argument_int(value, 0, 100);
+			options->opacity = argument_int(value, 0, 100);
 		else if (mode == 2 && !strcmp(key, "--output-height"))
-			opt.height = argument_int(value, 2, 16000);
+			options->height = argument_int(value, 2, 16000);
 		else if (mode == 2 && !strcmp(key, "--fps"))
-			rate(value, &opt.fps_num, &opt.fps_den);
+			rate(value, &options->fps_num, &options->fps_den);
 		else if (mode == 2 && !strcmp(key, "--hls-start")) {
-			opt.hls = 1;
-			opt.origin = rfc3339(value);
+			options->hls = 1;
+			options->origin = rfc3339(value);
 		} else if (mode == 2 && !strcmp(key, "--text-style")) {
 			if (strcmp(value, "outline") &&
 			    strcmp(value, "shadow"))
 				die("--text-style must be outline or shadow");
-			opt.shadow = !strcmp(value, "shadow");
+			options->shadow = !strcmp(value, "shadow");
 		} else {
 			die("unknown option: %s", key);
 		}
 	}
-	if ((mode == 1 && !opt.url) || (mode == 2 && !opt.video))
+	if ((mode == 1 && !options->url) || (mode == 2 && !options->video))
 		die("missing arguments; use --help");
-	if (mode == 2 && (!opt.chat || !opt.output))
-		render_paths();
-	if (!opt.duration || opt.travel < 1000)
+	if (mode == 2 && (!options->chat || !options->output))
+		render_paths(options, inferred_chat, inferred_output);
+	if (!options->duration || options->travel < 1000)
 		die("duration must be positive; travel-time must be >= 0.001 "
 		    "s");
 	return mode;
@@ -2489,11 +2624,14 @@ main(int argc, char **argv)
 	check(SDL_Init(0), "initialize SDL");
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
 		die("initialize HTTP library");
-	mode = arguments(argc, argv);
+	mode = arguments(&app.options, &app.inferred_chat,
+			 &app.inferred_output, argc, argv);
 	if (mode == 1)
-		download();
+		download(&app.options, &app.chat, &app.renderer, &app.work,
+			 &app.cache_stage, &app.child);
 	else
-		render();
+		render(&app.options, &app.chat, &app.glyphs, &app.renderer,
+		       &app.work, &app.cache_stage, &app.child);
 	return 0;
 }
 #endif

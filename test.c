@@ -77,16 +77,60 @@ fake_tool(int argc, char **argv)
 		die("test downloader failed");
 }
 
-static int
-colour_x(int colour)
+static void
+replacement_tests(App *run)
 {
+	cJSON *root;
+
+	root = parsejson(
+	    "{\"comments\":[],\"embeddedData\":{\"firstParty\":[{"
+	    "\"id\":\"replacement\",\"width\":2,\"height\":1,"
+	    "\"data\":\"first\"},{\"id\":\"replacement\",\"width\":3,"
+	    "\"height\":1,\"data\":\"second\"}]}}");
+	read_twitch(&run->chat, 0, 0, root);
+	cJSON_Delete(root);
+	expect(run->chat.nassets == 1 && run->chat.assets[0].aspect == 2 &&
+		   !strcmp(run->chat.assets[0].embedded, "second"),
+	       "repeated embedded URL replaces data but retains first aspect");
+	freechat(&run->chat, &run->renderer);
+}
+
+static void
+replacement_oom(App *run)
+{
+	cJSON *root;
+
+	root = parsejson("{\"comments\":[],\"embeddedData\":{\"firstParty\":[{"
+			 "\"id\":\"replacement\",\"width\":2,\"height\":1,"
+			 "\"data\":\"owned-before-replacement\"}]}}");
+	read_twitch(&run->chat, 0, 0, root);
+	cJSON_Delete(root);
+	expect(run->chat.nassets == 1 && run->chat.assets[0].embedded &&
+		   !strcmp(run->chat.assets[0].embedded,
+			   "owned-before-replacement") &&
+		   run->chat.assets[0].aspect == 2,
+	       "valid owned embedded value before replacement OOM");
+	root = parsejson("{\"comments\":[],\"embeddedData\":{\"firstParty\":[{"
+			 "\"id\":\"replacement\",\"width\":3,\"height\":1,"
+			 "\"data\":\"replacement\"}]}}");
+	run->fail_embedded_replacement = 1;
+	read_twitch(&run->chat, 0, 0, root);
+	cJSON_Delete(root);
+	die("test failed: replacement allocation did not fail");
+}
+
+static int
+colour_x(App *run, int colour)
+{
+	Renderer *renderer = &run->renderer;
 	int x, y, found, match;
 	unsigned char *p;
 
 	found = INT_MAX;
-	for (y = 0; y < canvas->h; y++) {
-		p = (unsigned char *)canvas->pixels + y * canvas->pitch;
-		for (x = 0; x < canvas->w; x++) {
+	for (y = 0; y < renderer->canvas->h; y++) {
+		p = (unsigned char *)renderer->canvas->pixels +
+		    y * renderer->canvas->pitch;
+		for (x = 0; x < renderer->canvas->w; x++) {
 			if (!p[x * 4 + 3])
 				continue;
 			match = colour == 0
@@ -144,9 +188,10 @@ reference_paste(SDL_Surface *to, const SDL_Surface *from, int x, int y)
 /* Floating-point destination sampling, independent of the fixed-point
  * span interpolation and sparse run representation. */
 static void
-reference_subpixel_paste(SDL_Surface *to, const SDL_Surface *from, double x,
-			 int y)
+reference_subpixel_paste(App *run, SDL_Surface *to, const SDL_Surface *from,
+			 double x, int y)
 {
+	Renderer *renderer = &run->renderer;
 	const unsigned char clear[4] = {0};
 	const unsigned char *a, *b, *row;
 	unsigned char *p;
@@ -154,7 +199,7 @@ reference_subpixel_paste(SDL_Surface *to, const SDL_Surface *from, double x,
 	double position, fraction, alpha, value;
 	int dx, dy, sx, sy, c;
 
-	sample = surface(to->w, to->h);
+	sample = surface(renderer, to->w, to->h);
 	for (dy = 0; dy < to->h; dy++) {
 		sy = dy - y;
 		if (sy < 0 || sy >= from->h)
@@ -182,7 +227,7 @@ reference_subpixel_paste(SDL_Surface *to, const SDL_Surface *from, double x,
 		}
 	}
 	reference_paste(to, sample, 0, 0);
-	surface_free(sample);
+	surface_free(renderer, sample);
 }
 
 static void
@@ -199,17 +244,18 @@ surfaces_equal(const SDL_Surface *a, const SDL_Surface *b)
 }
 
 static void
-blend_tests(void)
+blend_tests(App *run)
 {
+	Renderer *renderer = &run->renderer;
 	SDL_Surface *source, *actual, *expected;
 	unsigned char *s, *d;
 	int x, y;
 	size_t before;
 
-	before = surface_bytes;
-	source = surface(256, 256);
-	actual = surface(256, 256);
-	expected = surface(256, 256);
+	before = renderer->surface_bytes;
+	source = surface(renderer, 256, 256);
+	actual = surface(renderer, 256, 256);
+	expected = surface(renderer, 256, 256);
 	/* All 65,536 source/destination alpha pairs, including hidden RGB. */
 	for (y = 0; y < 256; y++) {
 		for (x = 0; x < 256; x++) {
@@ -233,15 +279,16 @@ blend_tests(void)
 	reference_paste(expected, source, 0, 0);
 	paste(actual, source, 0, 0);
 	surfaces_equal(actual, expected);
-	surface_free(source);
-	surface_free(actual);
-	surface_free(expected);
-	expect(surface_bytes == before, "blend fixtures released");
+	surface_free(renderer, source);
+	surface_free(renderer, actual);
+	surface_free(renderer, expected);
+	expect(renderer->surface_bytes == before, "blend fixtures released");
 }
 
 static void
-sprite_tests(void)
+sprite_tests(App *run)
 {
+	Renderer *renderer = &run->renderer;
 	const double xs[] = {-80,   -64,  -63.75, -63,	 -5.75, -5,
 			     -0.75, -0.5, -0.25,  0,	 0.25,	0.5,
 			     0.75,  9,	  9.5,	  31.75, 32};
@@ -252,10 +299,10 @@ sprite_tests(void)
 	int variant, x, y, visible;
 	size_t i, j, before, allocated;
 
-	before = surface_bytes;
+	before = renderer->surface_bytes;
 	for (variant = 0; variant < 5; variant++) {
-		source = surface(64, 6);
-		reference = surface(64, 6);
+		source = surface(renderer, 64, 6);
+		reference = surface(renderer, 64, 6);
 		for (y = 0; y < source->h; y++) {
 			for (x = 0; x < source->w; x++) {
 				p = (unsigned char *)source->pixels +
@@ -280,15 +327,15 @@ sprite_tests(void)
 				   y * source->pitch,
 			       64 * 4);
 		}
-		allocated = surface_bytes;
+		allocated = renderer->surface_bytes;
 		if (variant == 4)
-			surface_bytes = MAX_MEMORY;
-		sprite = sprite_create(source);
+			renderer->surface_bytes = MAX_MEMORY;
+		sprite = sprite_create(renderer, source);
 		if (variant == 4)
-			surface_bytes = allocated;
+			renderer->surface_bytes = allocated;
 		if (variant == 0)
 			expect(!sprite->pixels && sprite->bytes &&
-				   surface_bytes < allocated,
+				   renderer->surface_bytes < allocated,
 			       "transparent pixels omitted and dense storage "
 			       "released");
 		else if (variant == 1)
@@ -298,8 +345,8 @@ sprite_tests(void)
 			expect(sprite->pixels == source && !sprite->bytes,
 			       "dense/checkerboard/budget fallback preserves "
 			       "source");
-		actual = surface(32, 8);
-		expected = surface(32, 8);
+		actual = surface(renderer, 32, 8);
+		expected = surface(renderer, 32, 8);
 		for (i = 0; i < sizeof xs / sizeof *xs; i++) {
 			for (j = 0; j < sizeof ys / sizeof *ys; j++) {
 				for (y = 0; y < actual->h; y++) {
@@ -322,28 +369,34 @@ sprite_tests(void)
 						y * actual->pitch,
 					    32 * 4);
 				}
-				reference_subpixel_paste(expected, reference,
-							 xs[i], ys[j]);
-				reference_subpixel_paste(expected, reference,
-							 xs[i] + 1, ys[j] + 1);
+				reference_subpixel_paste(
+				    run, expected, reference, xs[i], ys[j]);
+				reference_subpixel_paste(run, expected,
+							 reference, xs[i] + 1,
+							 ys[j] + 1);
 				paste_sprite(actual, sprite, xs[i], ys[j]);
 				paste_sprite(actual, sprite, xs[i] + 1,
 					     ys[j] + 1);
 				surfaces_equal(actual, expected);
 			}
 		}
-		surface_free(actual);
-		surface_free(expected);
-		surface_free(reference);
-		sprite_free(sprite);
-		expect(surface_bytes == before,
+		surface_free(renderer, actual);
+		surface_free(renderer, expected);
+		surface_free(renderer, reference);
+		sprite_free(renderer, sprite);
+		expect(renderer->surface_bytes == before,
 		       "packed and dense sprite ownership");
 	}
 }
 
 static void
-subpixel_motion_tests(void)
+subpixel_motion_tests(App *run)
 {
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
 	const int64_t times[] = {600000, 550000, 500000, 450000};
 	const unsigned char left[] = {255, 191, 128, 64};
 	const unsigned char right[] = {0, 64, 128, 191};
@@ -358,18 +411,18 @@ subpixel_motion_tests(void)
 	unsigned char *pixels;
 	size_t i, index, before;
 
-	before = surface_bytes;
-	canvas = surface(4, 1);
-	image = surface(1, 1);
+	before = renderer->surface_bytes;
+	renderer->canvas = surface(renderer, 4, 1);
+	image = surface(renderer, 1, 1);
 	memset(image->pixels, 255, 4);
-	m = message(0);
+	m = message(scene, 0);
 	m->width = 1;
-	m->sprite = sprite_create(image);
-	opt.travel = SECOND;
-	opt.opacity = 100;
+	m->sprite = sprite_create(renderer, image);
+	plan->travel = SECOND;
+	plan->opacity = 100;
 	for (i = 0; i < sizeof times / sizeof *times; i++) {
-		drawframe(times[i], 0, 1, 0);
-		pixels = canvas->pixels;
+		drawframe(scene, glyphs, renderer, times[i], 0, 1, 0);
+		pixels = renderer->canvas->pixels;
 		expect(pixels[7] == left[i] && pixels[11] == right[i],
 		       "scrolling text retains fractional pixel coverage");
 		expect(pixels[3] == 0 && pixels[15] == 0,
@@ -378,57 +431,65 @@ subpixel_motion_tests(void)
 			   pixels[6] == 255,
 		       "subpixel text preserves its straight RGB color");
 	}
-	drawframe(50000, 0, 1, 0);
-	pixels = canvas->pixels;
+	drawframe(scene, glyphs, renderer, 50000, 0, 1, 0);
+	pixels = renderer->canvas->pixels;
 	expect(pixels[15] == 64 && pixels[3] == 0 && pixels[7] == 0 &&
 		   pixels[11] == 0,
 	       "subpixel text enters at the right edge");
-	drawframe(850000, 0, 1, 0);
+	drawframe(scene, glyphs, renderer, 850000, 0, 1, 0);
 	expect(pixels[3] == 191 && pixels[7] == 0 && pixels[11] == 0 &&
 		   pixels[15] == 0,
 	       "negative subpixel position clips at the left edge");
-	opt.opacity = 50;
-	drawframe(500000, 0, 1, 0);
+	plan->opacity = 50;
+	drawframe(scene, glyphs, renderer, 500000, 0, 1, 0);
 	expect(pixels[7] == 64 && pixels[11] == 64,
 	       "global opacity is applied after subpixel interpolation");
 
 	/* Text and animated images must use the same fractional phase. */
-	surface_free(canvas);
-	canvas = surface(5, 1);
-	lane_height = 1;
-	index = asset("https://example.com/subpixel.gif", 1);
-	a = &assets[index];
+	surface_free(renderer, renderer->canvas);
+	renderer->canvas = surface(renderer, 5, 1);
+	glyphs->lane_height = 1;
+	index = asset(scene, "https://example.com/subpixel.gif", 1);
+	a = &scene->assets[index];
 	a->frames = resize(NULL, 2, sizeof *a->frames);
 	a->ends = resize(NULL, 2, sizeof *a->ends);
 	a->count = 2;
 	a->ends[0] = 450000;
 	a->ends[1] = 850000;
 	for (i = 0; i < 2; i++) {
-		a->frames[i] = surface(1, 1);
+		a->frames[i] = surface(renderer, 1, 1);
 		pixels = a->frames[i]->pixels;
 		pixels[i * 2] = 255;
 		pixels[3] = 255;
 	}
-	part(m, "", index);
+	part(scene, m, "", index);
 	m->parts[0].x = 2;
 	m->width = 3;
 	for (i = 0; i < 2; i++) {
-		drawframe(437500 + (int64_t)i * 125000, 0, 1, 0);
+		drawframe(scene, glyphs, renderer,
+			  437500 + (int64_t)i * 125000, 0, 1, 0);
 		expect(
-		    !memcmp(canvas->pixels, gif_expected[i],
+		    !memcmp(renderer->canvas->pixels, gif_expected[i],
 			    sizeof gif_expected[i]),
 		    "text and GIF share subpixel movement, time and opacity");
 	}
-	freechat();
-	surface_free(canvas);
-	canvas = NULL;
-	memset(&opt, 0, sizeof opt);
-	expect(surface_bytes == before, "subpixel motion fixtures released");
+	freechat(scene, renderer);
+	surface_free(renderer, renderer->canvas);
+	renderer->canvas = NULL;
+	memset(options, 0, sizeof *options);
+	memset(plan, 0, sizeof *plan);
+	expect(renderer->surface_bytes == before,
+	       "subpixel motion fixtures released");
 }
 
 static void
-frame_bounds_tests(void)
+frame_bounds_tests(App *run)
 {
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
 	const int rates[][2] = {
 	    {25, 1}, {30000, 1001}, {113394000, 3780913}, {1, 10}, {240, 1}};
 	size_t i;
@@ -453,92 +514,252 @@ frame_bounds_tests(void)
 			       MAX_TIME,
 		       "inverse clock at the duration limit");
 	}
-	opt.start = 2 * SECOND;
-	opt.duration = 2 * SECOND;
-	opt.travel = SECOND / 4;
-	opt.fps_num = 30000;
-	opt.fps_den = 1001;
-	lane_height = 26;
-	m = message(1900000);
+	plan->start = 2 * SECOND;
+	plan->duration = 2 * SECOND;
+	plan->travel = SECOND / 4;
+	plan->fps_num = 30000;
+	plan->fps_den = 1001;
+	glyphs->lane_height = 26;
+	m = message(scene, 1900000);
 	m->y = 52;
-	m = message(2800000);
+	m = message(scene, 2800000);
 	m->y = 26;
-	o = overlay_plan(80);
+	plan->height = 80;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
 	expect(o.y == 26 && o.height == 52 && o.first == 0 && o.end == 32 &&
 		   o.visible == 2,
 	       "overlay band includes pre-seek messages");
-	opt.start = 2500000;
-	o = overlay_plan(50);
+	plan->start = 2500000;
+	plan->height = 50;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
 	expect(o.y == 26 && o.height == 24 && o.first == 9 && o.end == 17,
 	       "overlay clips the bottom lane and trims both ends");
-	opt.start = 3 * SECOND;
-	opt.duration = 1;
-	o = overlay_plan(80);
+	plan->start = 3 * SECOND;
+	plan->duration = 1;
+	plan->height = 80;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
 	expect(o.first == 0 && o.end == 1, "sub-frame clip");
-	opt.start = 3100000;
-	o = overlay_plan(80);
+	plan->start = 3100000;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
 	expect(o.y == 0 && o.height == 1 && o.first == 0 && o.end == 1 &&
 		   o.visible == 0,
 	       "empty clip retains one transparent sample");
-	freechat();
-	memset(&opt, 0, sizeof opt);
+	freechat(scene, renderer);
+	memset(options, 0, sizeof *options);
+	memset(plan, 0, sizeof *plan);
 }
 
 static void
-width_geometry_tests(void)
+lane_tests(void)
 {
+	Message measured[6] = {{0}};
+	size_t fallbacks;
+
+	measured[0].width = 20;
+	measured[1].width = 60;
+	measured[2].width = 10;
+	measured[3].width = 200;
+	measured[3].time = 500000;
+	measured[4].width = 20;
+	measured[4].time = 1000000;
+	measured[5].width = 20;
+	measured[5].time = 1500000;
+	fallbacks = assign_lanes(measured, 6, 100, 20, 10, 2, 1000000);
+	expect(fallbacks == 2 && measured[0].y == 0 && measured[1].y == 10 &&
+		   measured[2].y == 0 && measured[3].y == 0 &&
+		   measured[4].y == 10 && measured[5].y == 0,
+	       "numeric lanes retain overflow and faster-message collisions");
+	expect(
+	    measured[0].time == 0 && measured[0].width == 20 &&
+		measured[1].time == 0 && measured[1].width == 60 &&
+		measured[2].time == 0 && measured[2].width == 10 &&
+		measured[3].time == 500000 && measured[3].width == 200 &&
+		measured[4].time == 1000000 && measured[4].width == 20 &&
+		measured[5].time == 1500000 && measured[5].width == 20,
+	    "numeric scheduling preserves literal crossing times and widths");
+	fallbacks = assign_lanes(measured, 3, 100, 5, 10, 2, 1000000);
+	expect(fallbacks == 2 && measured[0].y == 0 && measured[1].y == 0 &&
+		   measured[2].y == 0,
+	       "short output retains one lane without postponing messages");
+	puts("unit: no-font numeric lane assignment OK");
+}
+
+static void
+plan_tests(void)
+{
+	Options input = {0}, saved;
+	Video video = {160, 90, 30000, 1001, 2000000};
+	RenderPlan plan;
+
+	input.start = 501000;
+	input.duration = -1;
+	input.travel = 300000;
+	input.height = 180;
+	input.opacity = 50;
+	input.shadow = 1;
+	memcpy(&saved, &input, sizeof input);
+	plan = resolve_plan(&input, &video);
+	expect(!memcmp(&input, &saved, sizeof input) && input.duration == -1 &&
+		   input.fps_num == 0 && input.fps_den == 0 &&
+		   input.height == 180,
+	       "plan resolution leaves all parsed option bytes unchanged");
+	expect(plan.width == 320 && plan.height == 180 &&
+		   plan.fps_num == 30000 && plan.fps_den == 1001 &&
+		   plan.start == 501000 && plan.duration == 1499000 &&
+		   plan.travel == 300000 && plan.opacity == 50 &&
+		   plan.shadow == 1,
+	       "plan resolves literal scaled geometry, default rate and "
+	       "clipped clock");
+	input.duration = 3000000;
+	input.height = 0;
+	input.fps_num = 113394000;
+	input.fps_den = 3780913;
+	memcpy(&saved, &input, sizeof input);
+	plan = resolve_plan(&input, &video);
+	expect(!memcmp(&input, &saved, sizeof input) && plan.width == 160 &&
+		   plan.height == 90 && plan.duration == 1499000 &&
+		   plan.fps_num == 113394000 && plan.fps_den == 3780913,
+	       "explicit rational rate is unchanged while overlong duration "
+	       "clips");
+	input.start = 0;
+	input.duration = 1;
+	input.opacity = 0;
+	input.shadow = 0;
+	memcpy(&saved, &input, sizeof input);
+	plan = resolve_plan(&input, &video);
+	expect(
+	    !memcmp(&input, &saved, sizeof input) && plan.start == 0 &&
+		plan.duration == 1 && plan.travel == 300000 &&
+		plan.opacity == 0 && plan.shadow == 0,
+	    "zero seek and subframe duration retain literal style and clock");
+	puts("unit: immutable input and resolved render plan OK");
+}
+
+static void
+replan_tests(App *run)
+{
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
+	Message *m;
+	Overlay o;
+
+	plan->start = 0;
+	plan->duration = SECOND;
+	plan->travel = SECOND;
+	plan->fps_num = 25;
+	plan->fps_den = 1;
+	glyphs->lane_height = 6;
+	asset(scene, "https://example.com/first.png", 1);
+	asset(scene, "https://example.com/second.png", 1);
+	m = message(scene, 0);
+	part(scene, m, "", 0);
+	m = message(scene, 2 * SECOND);
+	part(scene, m, "", 1);
+	plan->height = 12;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
+	expect(o.visible == 1 && scene->assets[0].needed == 1 &&
+		   scene->assets[1].needed == 0,
+	       "first plan selects only the first image");
+	plan->start = 2 * SECOND;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
+	expect(o.visible == 1 && scene->assets[0].needed == 0 &&
+		   scene->assets[1].needed == 1,
+	       "replan clears stale image selection and selects second image");
+	plan->start = 4 * SECOND;
+	o = overlay_plan(scene, plan, glyphs->lane_height);
+	expect(
+	    o.visible == 0 && o.height == 1 && o.first == 0 && o.end == 1 &&
+		scene->assets[0].needed == 0 && scene->assets[1].needed == 0,
+	    "empty replan clears every image and keeps one transparent frame");
+	freechat(scene, renderer);
+	memset(options, 0, sizeof *options);
+	memset(plan, 0, sizeof *plan);
+	puts("unit: independent visible-image replanning OK");
+}
+
+static void
+width_geometry_tests(App *run)
+{
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
 	SDL_Surface *source;
 	Message *m;
 	size_t index;
 	int decoded_width, decoded_height;
 
-	emote_height = 4;
-	lane_height = 6;
-	gap = 2;
-	font_size = 4;
-	opt.travel = SECOND;
-	index = asset("https://example.com/wide.png", 2);
-	m = message(123456);
-	part(m, "", index);
-	part(m, "", index);
-	expect(layout(20, 6) == 0, "image-only width scene has a free lane");
+	glyphs->emote_height = 4;
+	glyphs->lane_height = 6;
+	glyphs->gap = 2;
+	glyphs->font_size = 4;
+	plan->travel = SECOND;
+	index = asset(scene, "https://example.com/wide.png", 2);
+	m = message(scene, 123456);
+	part(scene, m, "", index);
+	part(scene, m, "", index);
+	measure(scene, glyphs);
+	expect(assign_lanes(scene->messages, scene->nmessages, 20, 6,
+			    glyphs->lane_height,
+			    glyphs->gap > glyphs->font_size / 2
+				? glyphs->gap
+				: glyphs->font_size / 2,
+			    plan->travel) == 0,
+	       "image-only width scene has a free lane");
 	expect(m->parts[0].x == 0 && m->parts[0].width == 8 &&
 		   m->parts[1].x == 10 && m->parts[1].width == 8 &&
 		   m->width == 18 && m->time == 123456,
 	       "aspect two measures literal positions and preserves time");
-	source = surface(2, 2);
-	asset_frame(&assets[index], source, 100);
-	decoded_width = assets[index].frames[0]->w;
-	decoded_height = assets[index].frames[0]->h;
-	surface_free(source);
-	freechat();
+	source = surface(renderer, 2, 2);
+	asset_frame(renderer, glyphs->emote_height, &scene->assets[index],
+		    source, 100);
+	decoded_width = scene->assets[index].frames[0]->w;
+	decoded_height = scene->assets[index].frames[0]->h;
+	surface_free(renderer, source);
+	freechat(scene, renderer);
 	expect(decoded_width == 8 && decoded_height == 4,
 	       "square RGBA source normalizes to metadata width eight");
 
-	index = asset("https://example.com/tiny.png", 0.01);
-	m = message(654321);
-	part(m, "", index);
-	part(m, "", index);
-	layout(20, 6);
+	index = asset(scene, "https://example.com/tiny.png", 0.01);
+	m = message(scene, 654321);
+	part(scene, m, "", index);
+	part(scene, m, "", index);
+	measure(scene, glyphs);
+	assign_lanes(
+	    scene->messages, scene->nmessages, 20, 6, glyphs->lane_height,
+	    glyphs->gap > glyphs->font_size / 2 ? glyphs->gap
+						: glyphs->font_size / 2,
+	    plan->travel);
 	expect(m->parts[0].x == 0 && m->parts[0].width == 1 &&
 		   m->parts[1].x == 3 && m->parts[1].width == 1 &&
 		   m->width == 4 && m->time == 654321,
 	       "tiny positive aspect measures width one and preserves time");
-	source = surface(2, 2);
-	asset_frame(&assets[index], source, 100);
-	decoded_width = assets[index].frames[0]->w;
-	decoded_height = assets[index].frames[0]->h;
-	surface_free(source);
-	freechat();
+	source = surface(renderer, 2, 2);
+	asset_frame(renderer, glyphs->emote_height, &scene->assets[index],
+		    source, 100);
+	decoded_width = scene->assets[index].frames[0]->w;
+	decoded_height = scene->assets[index].frames[0]->h;
+	surface_free(renderer, source);
+	freechat(scene, renderer);
 	expect(decoded_width == 1 && decoded_height == 4,
 	       "tiny positive aspect decodes to width one");
-	memset(&opt, 0, sizeof opt);
+	memset(options, 0, sizeof *options);
+	memset(plan, 0, sizeof *plan);
 	puts("unit: canonical width geometry OK");
 }
 
 static void
-asset_metadata_tests(void)
+asset_metadata_tests(App *run)
 {
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
 	cJSON *json;
 	char *url;
 	size_t i, index;
@@ -548,41 +769,58 @@ asset_metadata_tests(void)
 	    "\"width\":4,\"height\":2,\"data\":\"\"}]},\"comments\":[{"
 	    "\"content_offset_seconds\":0.25,\"message\":{\"fragments\":[{"
 	    "\"emoticon\":{\"emoticon_id\":\"wide\"}}]}}]}");
-	read_twitch(json);
+	read_twitch(scene, options->hls, options->origin, json);
 	cJSON_Delete(json);
-	expect(nassets == 1 && assets[0].aspect == 2,
+	expect(scene->nassets == 1 && scene->assets[0].aspect == 2,
 	       "Twitch first-party aspect precedes fragment fallback one");
-	expect(asset(assets[0].url, 3) == 0 && assets[0].aspect == 2,
+	expect(asset(scene, scene->assets[0].url, 3) == 0 &&
+		   scene->assets[0].aspect == 2,
 	       "later valid metadata retains first-seen aspect");
-	emote_height = 4;
-	lane_height = 6;
-	gap = 2;
-	font_size = 4;
-	opt.travel = SECOND;
-	layout(20, 6);
-	expect(messages[0].parts[0].x == 0 &&
-		   messages[0].parts[0].width == 8 && messages[0].width == 8 &&
-		   messages[0].time == 250000,
+	glyphs->emote_height = 4;
+	glyphs->lane_height = 6;
+	glyphs->gap = 2;
+	glyphs->font_size = 4;
+	plan->travel = SECOND;
+	measure(scene, glyphs);
+	assign_lanes(
+	    scene->messages, scene->nmessages, 20, 6, glyphs->lane_height,
+	    glyphs->gap > glyphs->font_size / 2 ? glyphs->gap
+						: glyphs->font_size / 2,
+	    plan->travel);
+	expect(scene->messages[0].parts[0].x == 0 &&
+		   scene->messages[0].parts[0].width == 8 &&
+		   scene->messages[0].width == 8 &&
+		   scene->messages[0].time == 250000,
 	       "first-seen aspect determines literal message geometry");
-	freechat();
+	freechat(scene, renderer);
 	for (i = 0; i < MAX_ASSETS; i++) {
 		url = format("https://example.com/capacity/%zu", i);
-		index = asset(url, 2);
+		index = asset(scene, url, 2);
 		free(url);
 		expect(index == i, "distinct URLs fill the asset capacity");
 	}
-	expect(asset("https://example.com/capacity/0", 1) == 0 &&
-		   asset("https://example.com/capacity/4095", 3) == 4095 &&
-		   nassets == 4096 && assets[0].aspect == 2 &&
-		   assets[4095].aspect == 2,
+	expect(asset(scene, "https://example.com/capacity/0", 1) == 0 &&
+		   asset(scene, "https://example.com/capacity/4095", 3) ==
+		       4095 &&
+		   scene->nassets == 4096 && scene->assets[0].aspect == 2 &&
+		   scene->assets[4095].aspect == 2,
 	       "valid existing URLs remain usable at full capacity");
-	freechat();
-	memset(&opt, 0, sizeof opt);
+	freechat(scene, renderer);
+	memset(options, 0, sizeof *options);
+	memset(plan, 0, sizeof *plan);
 }
 
 static void
-width_decode_tests(void)
+width_decode_tests(App *run)
 {
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
+	OutputWork *work = &run->work;
+	CacheStage *cache = &run->cache_stage;
+	SDL_Process **child = &run->child;
 	const double aspects[] = {2, 0.01};
 	const int widths[] = {8, 1};
 	SDL_Surface *source;
@@ -592,19 +830,27 @@ width_decode_tests(void)
 	char hash[65], *path;
 	size_t i, j, index;
 
-	emote_height = 4;
-	lane_height = 6;
-	gap = 2;
-	font_size = 4;
-	opt.travel = SECOND;
+	glyphs->emote_height = 4;
+	glyphs->lane_height = 6;
+	glyphs->gap = 2;
+	glyphs->font_size = 4;
+	plan->travel = SECOND;
 	for (i = 0; i < 2; i++) {
-		index = asset("https://example.com/width.gif", aspects[i]);
-		assets[index].embedded = copystr(gif);
-		m = message(123456);
-		part(m, "", index);
-		layout(20, 6);
-		a = &assets[index];
-		load_asset(a, workdir);
+		index =
+		    asset(scene, "https://example.com/width.gif", aspects[i]);
+		scene->assets[index].embedded = copystr(gif);
+		m = message(scene, 123456);
+		part(scene, m, "", index);
+		measure(scene, glyphs);
+		assign_lanes(scene->messages, scene->nmessages, 20, 6,
+			     glyphs->lane_height,
+			     glyphs->gap > glyphs->font_size / 2
+				 ? glyphs->gap
+				 : glyphs->font_size / 2,
+			     plan->travel);
+		a = &scene->assets[index];
+		load_asset(renderer, glyphs->emote_height, work, cache, child,
+			   a, work->directory);
 		expect(a->count == 2,
 		       "canonical width decodes two real GIF frames");
 		for (j = 0; j < 2; j++)
@@ -619,25 +865,33 @@ width_decode_tests(void)
 		       "GIF normalization preserves frame delays and message "
 		       "time");
 		hashurl(a->url, hash);
-		path = format("%s/%s", workdir, hash);
+		path = format("%s/%s", work->directory, hash);
 		check(SDL_RemovePath(path), "remove owned width GIF cache");
 		free(path);
-		freechat();
+		freechat(scene, renderer);
 
-		index = asset("https://example.com/width.png", aspects[i]);
-		m = message(654321);
-		part(m, "", index);
-		layout(20, 6);
-		hashurl(assets[index].url, hash);
-		path = format("%s/%s", workdir, hash);
-		source = surface(2, 2);
+		index =
+		    asset(scene, "https://example.com/width.png", aspects[i]);
+		m = message(scene, 654321);
+		part(scene, m, "", index);
+		measure(scene, glyphs);
+		assign_lanes(scene->messages, scene->nmessages, 20, 6,
+			     glyphs->lane_height,
+			     glyphs->gap > glyphs->font_size / 2
+				 ? glyphs->gap
+				 : glyphs->font_size / 2,
+			     plan->travel);
+		hashurl(scene->assets[index].url, hash);
+		path = format("%s/%s", work->directory, hash);
+		source = surface(renderer, 2, 2);
 		memset(source->pixels, 255, (size_t)source->pitch * source->h);
 		io = SDL_IOFromFile(path, "wb");
 		expect(io != NULL && IMG_SavePNG_IO(source, io, true),
 		       "write owned square PNG width fixture");
-		surface_free(source);
-		load_asset(&assets[index], workdir);
-		a = &assets[index];
+		surface_free(renderer, source);
+		load_asset(renderer, glyphs->emote_height, work, cache, child,
+			   &scene->assets[index], work->directory);
+		a = &scene->assets[index];
 		expect(a->count == 1 && a->frames[0]->w == widths[i] &&
 			   a->frames[0]->h == 4 && m->parts[0].x == 0 &&
 			   m->parts[0].width == widths[i] &&
@@ -646,15 +900,18 @@ width_decode_tests(void)
 		       "time");
 		check(SDL_RemovePath(path), "remove owned width PNG cache");
 		free(path);
-		freechat();
+		freechat(scene, renderer);
 	}
-	memset(&opt, 0, sizeof opt);
+	memset(options, 0, sizeof *options);
+	memset(plan, 0, sizeof *plan);
 	puts("unit: canonical PNG and GIF dimensions OK");
 }
 
 static void
-asset_frame_tests(void)
+asset_frame_tests(App *run)
 {
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
 	Asset a = {0};
 	SDL_Surface *source, *rgba, *scaled;
 	unsigned char *p;
@@ -662,11 +919,11 @@ asset_frame_tests(void)
 	size_t before, i;
 	int64_t t;
 
-	before = surface_bytes;
-	emote_height = 4;
+	before = renderer->surface_bytes;
+	glyphs->emote_height = 4;
 	a.target_width = 4;
 	for (size = 2; size <= 4; size += 2) {
-		source = surface(size, size);
+		source = surface(renderer, size, size);
 		for (y = 0; y < size; y++) {
 			p = (unsigned char *)source->pixels +
 			    y * source->pitch;
@@ -683,7 +940,7 @@ asset_frame_tests(void)
 		check(rgba != NULL, "reference emote conversion");
 		scaled = SDL_ScaleSurface(rgba, 4, 4, SDL_SCALEMODE_LINEAR);
 		check(scaled != NULL, "reference emote scale");
-		asset_frame(&a, source, 10000);
+		asset_frame(renderer, glyphs->emote_height, &a, source, 10000);
 		for (y = 0; y < 4; y++)
 			expect(!memcmp((unsigned char *)scaled->pixels +
 					   y * scaled->pitch,
@@ -694,19 +951,20 @@ asset_frame_tests(void)
 			       "adopted emote pixels equal copied pixels");
 		SDL_DestroySurface(rgba);
 		SDL_DestroySurface(scaled);
-		surface_free(source);
+		surface_free(renderer, source);
 	}
 	for (i = 0; i < a.count; i++)
-		surface_free(a.frames[i]);
+		surface_free(renderer, a.frames[i]);
 	free(a.frames);
 	free(a.ends);
-	expect(surface_bytes == before, "adopted surfaces are accounted once");
+	expect(renderer->surface_bytes == before,
+	       "adopted surfaces are accounted once");
 
 	a.count = MAX_FRAMES;
 	a.frames = resize(NULL, a.count, sizeof *a.frames);
 	a.ends = resize(NULL, a.count, sizeof *a.ends);
 	for (i = 0; i < a.count; i++) {
-		a.frames[i] = surface(1, 1);
+		a.frames[i] = surface(renderer, 1, 1);
 		a.ends[i] =
 		    (i ? a.ends[i - 1] : 0) + (int64_t)(i % 7 + 1) * 1000;
 	}
@@ -718,50 +976,56 @@ asset_frame_tests(void)
 		       "and loops");
 	}
 	for (i = 0; i < a.count; i++)
-		surface_free(a.frames[i]);
+		surface_free(renderer, a.frames[i]);
 	free(a.frames);
 	free(a.ends);
-	expect(surface_bytes == before, "test GIF surfaces released");
+	expect(renderer->surface_bytes == before,
+	       "test GIF surfaces released");
 }
 
 static void
-cropped_frame_test(int64_t now)
+cropped_frame_test(App *run, int64_t now)
 {
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
 	SDL_Surface *full;
 	int row;
 
-	full = canvas;
-	messages[0].y = lane_height;
-	drawframe(now, 0, 1, 0);
-	canvas = surface(full->w, lane_height);
-	drawframe(now, 0, 1, lane_height);
-	for (row = 0; row < canvas->h; row++)
+	full = renderer->canvas;
+	scene->messages[0].y = glyphs->lane_height;
+	drawframe(scene, glyphs, renderer, now, 0, 1, 0);
+	renderer->canvas = surface(renderer, full->w, glyphs->lane_height);
+	drawframe(scene, glyphs, renderer, now, 0, 1, glyphs->lane_height);
+	for (row = 0; row < renderer->canvas->h; row++)
 		expect(
-		    !memcmp((unsigned char *)canvas->pixels +
-				row * canvas->pitch,
+		    !memcmp((unsigned char *)renderer->canvas->pixels +
+				row * renderer->canvas->pitch,
 			    (unsigned char *)full->pixels +
-				(row + lane_height) * full->pitch,
-			    (size_t)canvas->w * 4),
+				(row + glyphs->lane_height) * full->pitch,
+			    (size_t)renderer->canvas->w * 4),
 		    "cropped RGBA band equals full text/GIF/alpha rendering");
-	surface_free(canvas);
-	canvas = full;
-	messages[0].y = 0;
+	surface_free(renderer, renderer->canvas);
+	renderer->canvas = full;
+	scene->messages[0].y = 0;
 }
 
 static void
-cache_cleanup_tests(void)
+cache_cleanup_tests(App *run)
 {
 #ifdef _WIN32
+	OutputWork *work = &run->work;
+	CacheStage *cache = &run->cache_stage;
 	char *directory, *payload;
 	wchar_t *w;
 	HANDLE held;
 
-	expect(!cache_stage.directory && !cache_stage.payload,
+	expect(!cache->directory && !cache->payload,
 	       "no active cache stage before cleanup fixture");
-	cache_stage.directory = private_directory(workdir);
-	cache_stage.payload = format("%s/payload", cache_stage.directory);
-	directory = copystr(cache_stage.directory);
-	payload = copystr(cache_stage.payload);
+	cache->directory = private_directory(work->directory);
+	cache->payload = format("%s/payload", cache->directory);
+	directory = copystr(cache->directory);
+	payload = copystr(cache->payload);
 	writefile(payload, "x", 1);
 	w = wide(payload);
 	held = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -769,24 +1033,34 @@ cache_cleanup_tests(void)
 	SDL_free(w);
 	expect(held != INVALID_HANDLE_VALUE,
 	       "hold cache payload without delete sharing");
-	end_cache_stage();
+	end_cache_stage(cache);
 	expect(CloseHandle(held) != 0, "release held cache payload");
-	if (!cache_stage.directory)
-		fprintf(stderr, "unit: cleanup fixture %s\n", workdir);
-	expect(cache_stage.directory && cache_stage.payload && exists(payload),
+	if (!cache->directory)
+		fprintf(stderr, "unit: cleanup fixture %s\n", work->directory);
+	expect(cache->directory && cache->payload && exists(payload),
 	       "failed cache cleanup retains owner");
-	end_cache_stage();
-	expect(!cache_stage.directory && !cache_stage.payload &&
-		   !exists(directory) && !exists(payload),
+	end_cache_stage(cache);
+	expect(!cache->directory && !cache->payload && !exists(directory) &&
+		   !exists(payload),
 	       "cache cleanup retry removes owned paths");
 	free(directory);
 	free(payload);
+#else
+	(void)run;
 #endif
 }
 
 static void
-tests(void)
+tests(App *run)
 {
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &run->renderer.plan;
+	OutputWork *work = &run->work;
+	CacheStage *cache = &run->cache_stage;
+	SDL_Process **child = &run->child;
 	SDL_Surface *a, *b;
 	unsigned char *pixel;
 	char hash[65], *destination, *cached;
@@ -809,13 +1083,16 @@ tests(void)
 	    "{\"url\":\"https://example.com/a.png\",\"width\":32,"
 	    "\"height\":16}]}}}]}}}}}]}}";
 
-	blend_tests();
-	sprite_tests();
-	subpixel_motion_tests();
-	frame_bounds_tests();
-	width_geometry_tests();
-	asset_metadata_tests();
-	asset_frame_tests();
+	blend_tests(run);
+	sprite_tests(run);
+	subpixel_motion_tests(run);
+	frame_bounds_tests(run);
+	lane_tests();
+	plan_tests();
+	replan_tests(run);
+	width_geometry_tests(run);
+	asset_metadata_tests(run);
+	asset_frame_tests(run);
 	rate("30000/1001", &num, &den);
 	expect(num == 30000 && den == 1001, "rational fps");
 	rate("113394000/3780913", &num, &den);
@@ -831,8 +1108,8 @@ tests(void)
 			     "b00361a396177a9cb410ff61f20015ad"),
 	       "SHA-256 cache names");
 
-	a = surface(1, 1);
-	b = surface(1, 1);
+	a = surface(renderer, 1, 1);
+	b = surface(renderer, 1, 1);
 	pixel = b->pixels;
 	pixel[0] = 255;
 	pixel[3] = 128;
@@ -848,8 +1125,8 @@ tests(void)
 	       "source-over colour");
 	paste(a, b, -2, -2);
 	paste(a, b, 2, 2);
-	surface_free(a);
-	surface_free(b);
+	surface_free(renderer, a);
+	surface_free(renderer, b);
 
 	tmp = SDL_getenv("TEMP");
 	if (!tmp)
@@ -857,88 +1134,107 @@ tests(void)
 	if (!tmp)
 		tmp = "/tmp";
 	destination = format("%s/bullet-unit.mp4", tmp);
-	beginwork(destination);
+	beginwork(work, destination);
 	free(destination);
-	stage = format("%s/chat.json", workdir);
-	cache_cleanup_tests();
-	width_decode_tests();
-	writefile(stage, youtube, strlen(youtube));
-	readchat(stage);
-	expect(nmessages == 1 && messages[0].time == 2 * SECOND,
+	work->stage = format("%s/chat.json", work->directory);
+	cache_cleanup_tests(run);
+	width_decode_tests(run);
+	writefile(work->stage, youtube, strlen(youtube));
+	readchat(scene, options->hls, options->origin, work->stage);
+	expect(scene->nmessages == 1 && scene->messages[0].time == 2 * SECOND,
 	       "YouTube pre-stream exclusion");
-	expect(messages[0].count == 2 && nassets == 1 && assets[0].aspect == 2,
+	expect(scene->messages[0].count == 2 && scene->nassets == 1 &&
+		   scene->assets[0].aspect == 2,
 	       "mixed YouTube text and image");
-	freechat();
+	freechat(scene, renderer);
 	json = parsejson("{\"comments\":[{\"content_offset_seconds\":5,"
 			 "\"created_at\":\"2026-01-01T00:00:06.100Z\","
 			 "\"message\":{\"body\":\"hello\"}}]}");
-	read_twitch(json);
-	expect(messages[0].time == 5 * SECOND, "no Twitch interpolation");
-	freechat();
-	opt.hls = 1;
-	opt.origin = rfc3339("2026-01-01T00:00:00Z");
-	read_twitch(json);
-	expect(messages[0].time == 6100000, "explicit HLS clock");
+	read_twitch(scene, options->hls, options->origin, json);
+	expect(scene->messages[0].time == 5 * SECOND,
+	       "no Twitch interpolation");
+	freechat(scene, renderer);
+	options->hls = 1;
+	options->origin = rfc3339("2026-01-01T00:00:00Z");
+	read_twitch(scene, options->hls, options->origin, json);
+	expect(scene->messages[0].time == 6100000, "explicit HLS clock");
 	cJSON_Delete(json);
-	freechat();
-	opt.hls = 0;
+	freechat(scene, renderer);
+	options->hls = 0;
 
-	opt.travel = 10 * SECOND;
-	opt.opacity = 50;
-	opt.font = SDL_getenv("BULLET_TEST_FONT");
-	openfont(200, 80);
-	index = asset("https://example.com/animated.gif", 1);
-	assets[index].embedded = copystr(gif);
-	assets[index].target_width = emote_height;
-	load_asset(&assets[index], workdir);
-	expect(assets[index].count == 2, "decode complete GIF");
-	pixel = frame_at(&assets[index], 50000)->pixels;
+	plan->travel = 10 * SECOND;
+	plan->opacity = 50;
+	options->font = SDL_getenv("BULLET_TEST_FONT");
+	openfont(glyphs, options->font, 200, 80);
+	index = asset(scene, "https://example.com/animated.gif", 1);
+	scene->assets[index].embedded = copystr(gif);
+	scene->assets[index].target_width = glyphs->emote_height;
+	load_asset(renderer, glyphs->emote_height, work, cache, child,
+		   &scene->assets[index], work->directory);
+	expect(scene->assets[index].count == 2, "decode complete GIF");
+	pixel = frame_at(&scene->assets[index], 50000)->pixels;
 	expect(pixel[0] == 255 && pixel[2] == 0, "first GIF frame");
-	pixel = frame_at(&assets[index], 150000)->pixels;
+	pixel = frame_at(&scene->assets[index], 150000)->pixels;
 	expect(pixel[0] == 0 && pixel[2] == 255, "second GIF frame");
-	pixel = frame_at(&assets[index], 350000)->pixels;
+	pixel = frame_at(&scene->assets[index], 350000)->pixels;
 	expect(pixel[0] == 255, "GIF loops");
-	m = message(0);
-	part(m, "M", NONE);
-	part(m, "", index);
-	expect(layout(200, 80) == 0, "free lane");
-	canvas = surface(200, 80);
-	drawframe(4850000, 0, 1, 0);
-	r = colour_x(0);
-	w = colour_x(2);
-	drawframe(4950000, 0, 1, 0);
-	blue = colour_x(1);
-	w2 = colour_x(2);
+	m = message(scene, 0);
+	part(scene, m, "M", NONE);
+	part(scene, m, "", index);
+	measure(scene, glyphs);
+	expect(assign_lanes(scene->messages, scene->nmessages, 200, 80,
+			    glyphs->lane_height,
+			    glyphs->gap > glyphs->font_size / 2
+				? glyphs->gap
+				: glyphs->font_size / 2,
+			    plan->travel) == 0,
+	       "free lane");
+	renderer->canvas = surface(renderer, 200, 80);
+	drawframe(scene, glyphs, renderer, 4850000, 0, 1, 0);
+	r = colour_x(run, 0);
+	w = colour_x(run, 2);
+	drawframe(scene, glyphs, renderer, 4950000, 0, 1, 0);
+	blue = colour_x(run, 1);
+	w2 = colour_x(run, 2);
 	expect(r - blue == w - w2 && r > blue,
 	       "text and animated image share position and time");
-	cropped_frame_test(4950000);
-	opt.shadow = 1;
-	sprite_free(m->sprite);
+	cropped_frame_test(run, 4950000);
+	plan->shadow = 1;
+	sprite_free(renderer, m->sprite);
 	m->sprite = NULL;
-	drawframe(4950000, 0, 1, 0);
-	expect(colour_x(1) == blue, "shadow does not move emote");
-	cropped_frame_test(4850000);
-	freechat();
-	index = asset("https://example.com/animated.gif", 1);
-	assets[index].target_width = emote_height;
-	load_asset(&assets[index], workdir);
-	expect(assets[index].count == 2, "offline GIF cache reuse");
-	hashurl(assets[index].url, hash);
-	cached = format("%s/%s", workdir, hash);
+	drawframe(scene, glyphs, renderer, 4950000, 0, 1, 0);
+	expect(colour_x(run, 1) == blue, "shadow does not move emote");
+	cropped_frame_test(run, 4850000);
+	freechat(scene, renderer);
+	index = asset(scene, "https://example.com/animated.gif", 1);
+	scene->assets[index].target_width = glyphs->emote_height;
+	load_asset(renderer, glyphs->emote_height, work, cache, child,
+		   &scene->assets[index], work->directory);
+	expect(scene->assets[index].count == 2, "offline GIF cache reuse");
+	hashurl(scene->assets[index].url, hash);
+	cached = format("%s/%s", work->directory, hash);
 	check(SDL_RemovePath(cached), "remove test cache");
 	free(cached);
-	freechat();
-	opt.travel = default_travel;
+	freechat(scene, renderer);
+	plan->travel = default_travel;
 	for (i = 0; i < 3; i++) {
-		m = message(0);
-		part(m, "hello", NONE);
+		m = message(scene, 0);
+		part(scene, m, "hello", NONE);
 	}
-	expect(layout(120, 16) == 2, "overlap fallback");
+	measure(scene, glyphs);
+	expect(assign_lanes(scene->messages, scene->nmessages, 120, 16,
+			    glyphs->lane_height,
+			    glyphs->gap > glyphs->font_size / 2
+				? glyphs->gap
+				: glyphs->font_size / 2,
+			    plan->travel) == 2,
+	       "overlap fallback");
 	for (i = 0; i < 3; i++)
-		expect(messages[i].time == 0 && messages[i].y == 0,
+		expect(scene->messages[i].time == 0 &&
+			   scene->messages[i].y == 0,
 		       "crowding never postpones a comment");
-	freechat();
-	endwork();
+	freechat(scene, renderer);
+	endwork(work, cache);
 	puts("unit: clock, JSON, alpha, GIF, cache, layout OK");
 }
 
@@ -946,14 +1242,16 @@ static unsigned int cli_checks;
 static const char *cli_program;
 
 static void
-command_case(int success, const char *error, const char *program, va_list ap)
+command_case(App *run, int success, const char *error, const char *program,
+	     va_list ap)
 {
+	OutputWork *work = &run->work;
+	SDL_Process **child = &run->child;
 	const char *args[80], *arg;
 	char *path;
 	unsigned char *diagnostic;
-	SDL_IOStream *log;
 	size_t n, i, length;
-	int status;
+	int status, closed;
 
 	args[0] = program;
 	n = 1;
@@ -962,14 +1260,16 @@ command_case(int success, const char *error, const char *program, va_list ap)
 		args[n++] = arg;
 	}
 	args[n] = NULL;
-	path = format("%s/command.stderr", workdir);
-	log = SDL_IOFromFile(path, "wb");
-	check(log != NULL, "create test command log");
-	spawn(args, 0, 0, log);
-	check(SDL_CloseIO(log), "close test command log");
-	check(SDL_WaitProcess(child, true, &status), "wait for test command");
-	SDL_DestroyProcess(child);
-	child = NULL;
+	path = format("%s/command.stderr", work->directory);
+	work->log = SDL_IOFromFile(path, "wb");
+	check(work->log != NULL, "create test command log");
+	spawn(child, args, 0, 0, work->log);
+	closed = SDL_CloseIO(work->log);
+	work->log = NULL;
+	check(closed, "close test command log");
+	check(SDL_WaitProcess(*child, true, &status), "wait for test command");
+	SDL_DestroyProcess(*child);
+	*child = NULL;
 	diagnostic = readfile(path, MAX_JSON, &length);
 	free(path);
 	if ((status == 0) != success ||
@@ -990,23 +1290,23 @@ command_case(int success, const char *error, const char *program, va_list ap)
 }
 
 static void
-run_case(int success, const char *program, ...)
+run_case(App *run, int success, const char *program, ...)
 {
 	va_list ap;
 
 	va_start(ap, program);
-	command_case(success, NULL, program, ap);
+	command_case(run, success, NULL, program, ap);
 	va_end(ap);
 }
 
 /* Exit 1 alone also accepts failures from unrelated guards or tools. */
 static void
-reject_case(const char *error, const char *program, ...)
+reject_case(App *run, const char *error, const char *program, ...)
 {
 	va_list ap;
 
 	va_start(ap, program);
-	command_case(0, error, program, ap);
+	command_case(run, 0, error, program, ap);
 	va_end(ap);
 }
 
@@ -1093,8 +1393,9 @@ ffmpeg_path(const char *search)
 }
 
 static void
-reference_ffmpeg(int argc, char **argv)
+reference_ffmpeg(App *run, int argc, char **argv)
 {
+	SDL_Process **child = &run->child;
 	const char *args[80];
 	SDL_PropertiesID props;
 	size_t n;
@@ -1122,27 +1423,29 @@ reference_ffmpeg(int argc, char **argv)
 				    SDL_PROP_PROCESS_CREATE_STDIN_NUMBER,
 				    SDL_PROCESS_STDIO_INHERITED),
 	      "inherit reference input");
-	child = SDL_CreateProcessWithProperties(props);
+	*child = SDL_CreateProcessWithProperties(props);
 	SDL_DestroyProperties(props);
-	if (!child)
+	if (!*child)
 		die("cannot start %s: %s", args[0], SDL_GetError());
-	waitchild();
+	waitchild(child);
 }
 
 static char *
-fixture(const char *name, const char *contents)
+fixture(App *run, const char *name, const char *contents)
 {
+	OutputWork *work = &run->work;
 	char *path;
 
-	path = format("%s/%s", workdir, name);
+	path = format("%s/%s", work->directory, name);
 	if (contents)
 		writefile(path, contents, strlen(contents));
 	return path;
 }
 
 static void
-audio_equal(const char *a, const char *b)
+audio_equal(App *run, const char *a, const char *b)
 {
+	SDL_Process **child = &run->child;
 	const char *args[] = {"ffprobe",
 			      "-v",
 			      "error",
@@ -1162,11 +1465,11 @@ audio_equal(const char *a, const char *b)
 	char *text;
 
 	args[12] = a;
-	text = capture(args);
+	text = capture(child, args);
 	x = parsejson(text);
 	free(text);
 	args[12] = b;
-	text = capture(args);
+	text = capture(child, args);
 	y = parsejson(text);
 	free(text);
 	px = field(x, "packets");
@@ -1188,8 +1491,9 @@ audio_equal(const char *a, const char *b)
 }
 
 static void
-media_equal(const char *a, const char *b)
+media_equal(App *run, const char *a, const char *b)
 {
+	SDL_Process **child = &run->child;
 	const char *args[] = {"ffmpeg",	  "-v",	       "error",	      "-i",
 			      NULL,	  "-map",      "0",	      "-c:a",
 			      "copy",	  "-fps_mode", "passthrough", "-f",
@@ -1197,9 +1501,9 @@ media_equal(const char *a, const char *b)
 	char *x, *y;
 
 	args[4] = a;
-	x = capture(args);
+	x = capture(child, args);
 	args[4] = b;
-	y = capture(args);
+	y = capture(child, args);
 	if (strcmp(x, y))
 		fprintf(stderr, "media mismatch: %s vs %s\n", a, b);
 	expect(!strcmp(x, y), "decoded pixels, audio packets and timestamps "
@@ -1209,30 +1513,31 @@ media_equal(const char *a, const char *b)
 }
 
 static void
-render_equal(const char *bullet, const char *tool, const char *source,
-	     const char *chat, const char *test_font, const char *start,
-	     const char *duration, const char *travel, const char *opacity,
-	     const char *style, const char *fps, const char *height)
+render_equal(App *run, const char *bullet, const char *tool,
+	     const char *source, const char *chat, const char *test_font,
+	     const char *start, const char *duration, const char *travel,
+	     const char *opacity, const char *style, const char *fps,
+	     const char *height)
 {
 	char *compact, *dense;
 
-	compact = fixture("compact.mp4", NULL);
-	dense = fixture("dense.mp4", NULL);
+	compact = fixture(run, "compact.mp4", NULL);
+	dense = fixture(run, "dense.mp4", NULL);
 	/* Normal CLI cases retain the production encoder configuration. */
 	reference_encoder(1);
-	run_case(1, bullet, "render", source, chat, "--output", compact,
+	run_case(run, 1, bullet, "render", source, chat, "--output", compact,
 		 "--force", "--font", test_font, "--start", start,
 		 "--duration", duration, "--travel-time", travel, "--opacity",
 		 opacity, "--text-style", style, "--fps", fps,
 		 "--output-height", height, NULL);
-	run_case(1, tool, "--dense-render", source, chat, "--output", dense,
-		 "--force", "--font", test_font, "--start", start,
+	run_case(run, 1, tool, "--dense-render", source, chat, "--output",
+		 dense, "--force", "--font", test_font, "--start", start,
 		 "--duration", duration, "--travel-time", travel, "--opacity",
 		 opacity, "--text-style", style, "--fps", fps,
 		 "--output-height", height, NULL);
 	reference_encoder(0);
-	media_equal(compact, dense);
-	audio_equal(compact, dense);
+	media_equal(run, compact, dense);
+	audio_equal(run, compact, dense);
 	free(compact);
 	free(dense);
 }
@@ -1246,13 +1551,18 @@ remove_entry(void *unused, const char *dir, const char *name)
 	(void)unused;
 	if (!strcmp(name, ".") || !strcmp(name, ".."))
 		return SDL_ENUM_CONTINUE;
-	path = format("%s/%s", dir, name);
-	check(SDL_GetPathInfo(path, &info), "stat test file");
-	if (info.type == SDL_PATHTYPE_DIRECTORY)
-		check(SDL_EnumerateDirectory(path, remove_entry, NULL),
-		      "clean test directory");
-	check(SDL_RemovePath(path), "remove test file");
-	free(path);
+	if (SDL_asprintf(&path, "%s/%s", dir, name) < 0) {
+		SDL_SetError("out of memory building fixture path");
+		return SDL_ENUM_FAILURE;
+	}
+	if (!SDL_GetPathInfo(path, &info) ||
+	    (info.type == SDL_PATHTYPE_DIRECTORY &&
+	     !SDL_EnumerateDirectory(path, remove_entry, NULL)) ||
+	    !SDL_RemovePath(path)) {
+		SDL_free(path);
+		return SDL_ENUM_FAILURE;
+	}
+	SDL_free(path);
 	return SDL_ENUM_CONTINUE;
 }
 
@@ -1267,18 +1577,28 @@ count_entry(void *data, const char *dir, const char *name)
 
 static char *cross_fixture;
 
-static void
+static int
 end_cross_fixture(void)
 {
 	if (cross_fixture) {
-		check(
-		    SDL_EnumerateDirectory(cross_fixture, remove_entry, NULL),
-		    "clean cross-filesystem fixture");
-		check(SDL_RemovePath(cross_fixture),
-		      "remove cross-filesystem fixture");
+		if (!SDL_EnumerateDirectory(cross_fixture, remove_entry,
+					    NULL) ||
+		    !SDL_RemovePath(cross_fixture))
+			return 0;
 		free(cross_fixture);
 		cross_fixture = NULL;
 	}
+	return 1;
+}
+
+static void
+cleanup_cross_fixture(void)
+{
+	if (!end_cross_fixture())
+		fprintf(stderr,
+			"bullet: cannot remove cross-filesystem fixture: %s: "
+			"%s\n",
+			cross_fixture, SDL_GetError());
 }
 
 static char *
@@ -1368,9 +1688,85 @@ cross_directory(const char *root)
 }
 
 static void
-cross_cache_tests(const char *bullet, const char *source, const char *original,
-		  const char *test_font)
+held_cross_exit(void)
 {
+#ifdef _WIN32
+	char *path;
+	wchar_t *w;
+	HANDLE held;
+
+	expect(atexit(cleanup_cross_fixture) == 0,
+	       "register held fixture cleanup");
+	cross_fixture = cross_directory(SDL_GetBasePath());
+	expect(cross_fixture != NULL, "create owned held fixture");
+	path = format("%s/held", cross_fixture);
+	writefile(path, "x", 1);
+	w = wide(path);
+	held = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	SDL_free(w);
+	free(path);
+	expect(held != INVALID_HANDLE_VALUE,
+	       "hold cross fixture without delete sharing");
+	printf("held cross fixture %s\n", cross_fixture);
+	fflush(stdout);
+	fprintf(stderr, "bullet: intentional held cross fixture exit\n");
+	exit(23);
+#else
+	die("held cross fixture requires Windows delete sharing");
+#endif
+}
+
+static void
+cross_cleanup_retry(void)
+{
+#ifdef _WIN32
+	char *owner, *nested, *path;
+	wchar_t *w;
+	HANDLE held;
+
+	expect(!cross_fixture, "no active cross fixture before retry test");
+	expect(atexit(cleanup_cross_fixture) == 0,
+	       "register retry fixture cleanup");
+	cross_fixture = cross_directory(SDL_GetBasePath());
+	expect(cross_fixture != NULL, "create owned retry fixture");
+	owner = cross_fixture;
+	nested = format("%s/nested", owner);
+	check(SDL_CreateDirectory(nested), "create nested cleanup fixture");
+	path = format("%s/held", nested);
+	writefile(path, "x", 1);
+	w = wide(path);
+	held = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	SDL_free(w);
+	expect(held != INVALID_HANDLE_VALUE,
+	       "hold nested fixture without delete sharing");
+	expect(!end_cross_fixture(), "held recursive cleanup returns failure");
+	expect(cross_fixture == owner && exists(owner) && exists(nested) &&
+		   exists(path),
+	       "failed recursive cleanup retains owner and held tree");
+	check(CloseHandle(held) != 0, "release held nested fixture");
+	owner = copystr(cross_fixture);
+	check(end_cross_fixture(), "retry recursive fixture cleanup");
+	expect(!cross_fixture && !exists(owner) && !exists(nested) &&
+		   !exists(path),
+	       "released handle permits removal and clears owner");
+	expect(end_cross_fixture(), "empty fixture cleanup is harmless");
+	free(owner);
+	free(nested);
+	free(path);
+	puts("unit: held cross cleanup retry passed");
+#else
+	puts("unit: held cross cleanup retry SKIP, requires Windows delete "
+	     "sharing");
+#endif
+}
+
+static void
+cross_cache_tests(App *run, const char *bullet, const char *source,
+		  const char *original, const char *test_font)
+{
+	OutputWork *work = &run->work;
 	const char *roots[] = {SDL_GetBasePath(),
 #ifndef _WIN32
 			       "/dev/shm",
@@ -1385,9 +1781,9 @@ cross_cache_tests(const char *bullet, const char *source, const char *original,
 	wchar_t *w;
 #endif
 
-	expect(atexit(end_cross_fixture) == 0,
+	expect(atexit(cleanup_cross_fixture) == 0,
 	       "register cross-filesystem fixture cleanup");
-	input_id = filesystem_id(workdir);
+	input_id = filesystem_id(work->directory);
 	expect(input_id != NULL, "identify fixture filesystem");
 	output_id = NULL;
 	for (i = 0; roots[i]; i++) {
@@ -1421,7 +1817,7 @@ cross_cache_tests(const char *bullet, const char *source, const char *original,
 	fflush(stdout);
 	free(input_id);
 	free(output_id);
-	dir = fixture("cross-chat", NULL);
+	dir = fixture(run, "cross-chat", NULL);
 	check(SDL_CreateDirectory(dir),
 	      "create cross-filesystem chat fixture");
 	chat = format("%s/chat.json", dir);
@@ -1444,10 +1840,10 @@ cross_cache_tests(const char *bullet, const char *source, const char *original,
 	output = format("%s/output.mp4", cross_fixture);
 	saved_output = format("%s/output-before.mp4", cross_fixture);
 	writefile(output, "existing output", 15);
-	run_case(1, bullet, "render", source, chat, "--output", output,
+	run_case(run, 1, bullet, "render", source, chat, "--output", output,
 		 "--force", "--duration", "0.3", "--font", test_font, NULL);
-	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", output, "-f",
-		 "null", "-", NULL);
+	run_case(run, 1, "ffmpeg", "-v", "error", "-xerror", "-i", output,
+		 "-f", "null", "-", NULL);
 	bytes = readfile(encoded, MAX_ASSET, &n);
 	text = (char *)unbase64(gif, &i);
 	expect(n == i && !memcmp(bytes, text, n),
@@ -1464,7 +1860,7 @@ cross_cache_tests(const char *bullet, const char *source, const char *original,
 	expect(chmod(encoded, 0400) == 0 && chmod(cache, 0500) == 0,
 	       "make fixture cache read-only");
 #endif
-	run_case(1, bullet, "render", source, chat, "--output", output,
+	run_case(run, 1, bullet, "render", source, chat, "--output", output,
 		 "--force", "--duration", "0.3", "--font", test_font, NULL);
 	samebytes(output, saved_output);
 #ifdef _WIN32
@@ -1485,7 +1881,7 @@ cross_cache_tests(const char *bullet, const char *source, const char *original,
 	    (int)strlen(gif) - 16, gif);
 	writefile(bad_chat, text, strlen(text));
 	free(text);
-	reject_case("external command failed", bullet, "render", source,
+	reject_case(run, "external command failed", bullet, "render", source,
 		    bad_chat, "--output", output, "--force", "--duration",
 		    "0.3", "--font", test_font, NULL);
 	samebytes(output, saved_output);
@@ -1522,12 +1918,16 @@ cross_cache_tests(const char *bullet, const char *source, const char *original,
 	free(saved_output);
 	free(cache);
 	free(encoded);
-	end_cross_fixture();
+	check(end_cross_fixture(), "clean cross-filesystem fixture");
 }
 
 static void
-cli_tests(const char *bullet, const char *tool)
+cli_tests(App *run, const char *bullet, const char *tool)
 {
+	Renderer *renderer = &run->renderer;
+	OutputWork *work = &run->work;
+	CacheStage *cache = &run->cache_stage;
+	SDL_Process **child = &run->child;
 	const char *tmp, *test_font;
 	const char *version[] = {bullet, "--version", NULL};
 	char hash[65];
@@ -1603,14 +2003,14 @@ cli_tests(const char *bullet, const char *tool)
 	if (!tmp)
 		tmp = "/tmp";
 	destination = format("%s/bullet-cli.mp4", tmp);
-	beginwork(destination);
+	beginwork(work, destination);
 	free(destination);
-	source = fixture("元動画 ' & (source).mp4", NULL);
-	original = fixture("original.mp4", NULL);
-	chat = fixture("replay.data", twitch);
-	result = fixture("result.mp4", NULL);
-	saved = fixture("saved.mp4", NULL);
-	invalid = fixture("invalid.mp4", NULL);
+	source = fixture(run, "元動画 ' & (source).mp4", NULL);
+	original = fixture(run, "original.mp4", NULL);
+	chat = fixture(run, "replay.data", twitch);
+	result = fixture(run, "result.mp4", NULL);
+	saved = fixture(run, "saved.mp4", NULL);
+	invalid = fixture(run, "invalid.mp4", NULL);
 	test_font = SDL_getenv("BULLET_TEST_FONT");
 	if (!test_font) {
 		for (i = 0; i < sizeof fonts / sizeof *fonts; i++)
@@ -1638,7 +2038,7 @@ cli_tests(const char *bullet, const char *tool)
 	tmp = SDL_getenv(path_key);
 	expect(tmp != NULL, "PATH for CLI tests");
 	oldpath = copystr(tmp);
-	fake_bin = fixture("fake-bin", NULL);
+	fake_bin = fixture(run, "fake-bin", NULL);
 	check(SDL_CreateDirectory(fake_bin), "create test bin directory");
 #ifdef _WIN32
 	fake_ffmpeg = format("%s/ffmpeg.exe", fake_bin);
@@ -1658,85 +2058,86 @@ cli_tests(const char *bullet, const char *tool)
 	real_ffmpeg = ffmpeg_path(oldpath);
 	test_env("BULLET_REAL_FFMPEG", real_ffmpeg);
 	free(real_ffmpeg);
-	run_case(1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+	run_case(run, 1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
 		 "testsrc2=s=160x90:r=30000/1001", "-f", "lavfi", "-i",
 		 "sine=frequency=1000:sample_rate=48000", "-t", "2", "-c:v",
 		 "libx264", "-g", "12", "-preset", "ultrafast", "-c:a", "aac",
 		 "-movflags", "+faststart", source, NULL);
 	copyfile(source, original);
-	cross_cache_tests(bullet, source, original, test_font);
-	run_case(1, bullet, "--help", NULL);
-	text = capture(version);
+	cross_cache_tests(run, bullet, source, original, test_font);
+	run_case(run, 1, bullet, "--help", NULL);
+	text = capture(child, version);
 	expect(!strcmp(text, "bullet 0.1.0\n") ||
 		   !strcmp(text, "bullet 0.1.0\r\n"),
 	       "CLI reports the release version");
 	free(text);
-	auto_video = fixture("auto.mp4", NULL);
-	auto_chat = fixture("auto.chat.json", twitch);
-	auto_output = fixture("auto.bullet.mp4", NULL);
-	second_chat = fixture("auto.live_chat.json", NULL);
+	auto_video = fixture(run, "auto.mp4", NULL);
+	auto_chat = fixture(run, "auto.chat.json", twitch);
+	auto_output = fixture(run, "auto.bullet.mp4", NULL);
+	second_chat = fixture(run, "auto.live_chat.json", NULL);
 	copyfile(source, auto_video);
-	run_case(1, bullet, "render", auto_video, "--font", test_font,
+	run_case(run, 1, bullet, "render", auto_video, "--font", test_font,
 		 "--duration", "0.3", NULL);
-	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", auto_output,
+	run_case(run, 1, "ffmpeg", "-v", "error", "-xerror", "-i", auto_output,
 		 "-f", "null", "-", NULL);
-	reject_case("output exists", bullet, "render", auto_video, "--font",
-		    test_font, NULL);
+	reject_case(run, "output exists", bullet, "render", auto_video,
+		    "--font", test_font, NULL);
 	writefile(second_chat, youtube, strlen(youtube));
-	reject_case("both chat formats exist", bullet, "render", auto_video,
-		    "--font", test_font, "--force", NULL);
-	run_case(1, bullet, "render", auto_video, auto_chat, "--duration",
+	reject_case(run, "both chat formats exist", bullet, "render",
+		    auto_video, "--font", test_font, "--force", NULL);
+	run_case(run, 1, bullet, "render", auto_video, auto_chat, "--duration",
 		 "0.3", "--force", "--font", test_font, NULL);
 	check(SDL_RemovePath(auto_chat), "remove mock Twitch chat");
-	run_case(1, bullet, "render", auto_video, "--duration", "0.3",
+	run_case(run, 1, bullet, "render", auto_video, "--duration", "0.3",
 		 "--force", "--font", test_font, NULL);
 	check(SDL_RemovePath(second_chat), "remove mock YouTube chat");
-	reject_case("no chat beside VIDEO", bullet, "render", auto_video,
+	reject_case(run, "no chat beside VIDEO", bullet, "render", auto_video,
 		    "--force", NULL);
 	samebytes(auto_video, source);
 	free(auto_video);
 	free(auto_chat);
 	free(auto_output);
 	free(second_chat);
-	path = fixture("sparse.data", sparse);
+	path = fixture(run, "sparse.data", sparse);
 	/* Prefix/suffix trimming, internal gaps, nonzero crop origin, no
 	 * sampled chat, sub-frame duration, scaling and rational clocks. */
-	render_equal(bullet, tool, source, path, test_font, "0", "2", "0.3",
-		     "50", "outline", "30000/1001", "90");
-	render_equal(bullet, tool, source, path, test_font, "0.501", "0.3",
-		     "0.3", "100", "shadow", "25", "90");
-	render_equal(bullet, tool, source, path, test_font, "0.8", "0.2",
+	render_equal(run, bullet, tool, source, path, test_font, "0", "2",
 		     "0.3", "50", "outline", "30000/1001", "90");
-	render_equal(bullet, tool, source, path, test_font, "0", "0.1", "0.3",
-		     "0", "shadow", "30000/1001", "90");
-	render_equal(bullet, tool, source, path, test_font, "0", "2", "0.001",
-		     "50", "outline", "25", "90");
-	render_equal(bullet, tool, source, path, test_font, "0.501", "0.001",
-		     "0.3", "50", "outline", "113394000/3780913", "90");
-	render_equal(bullet, tool, source, path, test_font, "0.05", "1.8",
+	render_equal(run, bullet, tool, source, path, test_font, "0.501",
+		     "0.3", "0.3", "100", "shadow", "25", "90");
+	render_equal(run, bullet, tool, source, path, test_font, "0.8", "0.2",
+		     "0.3", "50", "outline", "30000/1001", "90");
+	render_equal(run, bullet, tool, source, path, test_font, "0", "0.1",
+		     "0.3", "0", "shadow", "30000/1001", "90");
+	render_equal(run, bullet, tool, source, path, test_font, "0", "2",
+		     "0.001", "50", "outline", "25", "90");
+	render_equal(run, bullet, tool, source, path, test_font, "0.501",
+		     "0.001", "0.3", "50", "outline", "113394000/3780913",
+		     "90");
+	render_equal(run, bullet, tool, source, path, test_font, "0.05", "1.8",
 		     "0.3", "50", "shadow", "113394000/3780913", "180");
 	free(path);
-	reject_case("no chat beside VIDEO", bullet, "render", original,
+	reject_case(run, "no chat beside VIDEO", bullet, "render", original,
 		    "--output", result, NULL);
-	run_case(1, bullet, "render", source, chat, "--output", result,
+	run_case(run, 1, bullet, "render", source, chat, "--output", result,
 		 "--font", test_font, NULL);
-	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", result, "-f",
-		 "null", "-", NULL);
-	v = probe(result);
+	run_case(run, 1, "ffmpeg", "-v", "error", "-xerror", "-i", result,
+		 "-f", "null", "-", NULL);
+	v = probe(child, result);
 	expect(v.fps_num == 30000 && v.fps_den == 1001, "CLI rational fps");
-	audio_equal(source, result);
+	audio_equal(run, source, result);
 	copyfile(result, saved);
-	reject_case("output exists", bullet, "render", source, chat,
+	reject_case(run, "output exists", bullet, "render", source, chat,
 		    "--output", result, NULL);
 	samebytes(result, saved);
-	run_case(1, bullet, "render", source, chat, "--output", result,
+	run_case(run, 1, bullet, "render", source, chat, "--output", result,
 		 "--force", "--duration", "0.3", "--font", test_font, NULL);
-	reject_case("output cannot be the source video or chat", bullet,
+	reject_case(run, "output cannot be the source video or chat", bullet,
 		    "render", source, chat, "--output", source, "--force",
 		    NULL);
-	reject_case("output cannot be the source video or chat", bullet,
+	reject_case(run, "output cannot be the source video or chat", bullet,
 		    "render", source, chat, "--output", chat, "--force", NULL);
-	alias = fixture("hardlink.mp4", NULL);
+	alias = fixture(run, "hardlink.mp4", NULL);
 #ifdef _WIN32
 	wa = wide(alias);
 	wb = wide(source);
@@ -1746,18 +2147,18 @@ cli_tests(const char *bullet, const char *tool)
 #else
 	expect(link(source, alias) == 0, "create test hardlink");
 #endif
-	reject_case("output cannot be the source video or chat", bullet,
+	reject_case(run, "output cannot be the source video or chat", bullet,
 		    "render", source, chat, "--output", alias, "--force",
 		    NULL);
 	samebytes(source, alias);
 	free(alias);
 
-	backup = fixture("new.backup.mp4", NULL);
+	backup = fixture(run, "new.backup.mp4", NULL);
 	copyfile(source, backup);
-	log = fixture("new.ffmpeg.log", "untouched log");
-	partial = fixture("new.part.mp4", "untouched partial");
-	other = fixture("new.mp4", NULL);
-	run_case(1, bullet, "render", backup, chat, "--output", other,
+	log = fixture(run, "new.ffmpeg.log", "untouched log");
+	partial = fixture(run, "new.part.mp4", "untouched partial");
+	other = fixture(run, "new.mp4", NULL);
+	run_case(run, 1, bullet, "render", backup, chat, "--output", other,
 		 "--duration", "0.3", "--font", test_font, NULL);
 	samebytes(backup, original);
 	data = readfile(log, MAX_JSON, &n);
@@ -1768,7 +2169,7 @@ cli_tests(const char *bullet, const char *tool)
 	       "unrelated part");
 	free(data);
 	writefile(log, twitch, strlen(twitch));
-	run_case(1, bullet, "render", source, log, "--output", other,
+	run_case(run, 1, bullet, "render", source, log, "--output", other,
 		 "--force", "--duration", "0.3", "--font", test_font, NULL);
 	samebytes(log, chat);
 	samebytes(backup, original);
@@ -1777,55 +2178,57 @@ cli_tests(const char *bullet, const char *tool)
 	free(partial);
 	free(other);
 
-	broken = fixture("broken.mp4", NULL);
+	broken = fixture(run, "broken.mp4", NULL);
 	data = readfile(source, MAX_JSON, &n);
 	writefile(broken, data, n * 2 / 3);
 	free(data);
-	probe(broken);
-	run_case(0, "ffmpeg", "-v", "error", "-xerror", "-i", broken, "-f",
-		 "null", "-", NULL);
+	probe(child, broken);
+	run_case(run, 0, "ffmpeg", "-v", "error", "-xerror", "-i", broken,
+		 "-f", "null", "-", NULL);
 	copyfile(result, saved);
 	/* Decoder failure can reach the pipe write or the process wait.
 	 * Require the FFmpeg phase, not one timing-dependent symptom. */
-	reject_case("FFmpeg log:", bullet, "render", broken, chat, "--output",
-		    result, "--force", "--font", test_font, NULL);
+	reject_case(run, "FFmpeg log:", bullet, "render", broken, chat,
+		    "--output", result, "--force", "--font", test_font, NULL);
 	samebytes(result, saved);
 	free(broken);
 	for (i = 0; i < sizeof bad_options / sizeof *bad_options; i++)
-		reject_case(bad_options[i].error, bullet, "render", source,
-			    chat, "--output", invalid, bad_options[i].key,
-			    bad_options[i].value, NULL);
+		reject_case(run, bad_options[i].error, bullet, "render",
+			    source, chat, "--output", invalid,
+			    bad_options[i].key, bad_options[i].value, NULL);
 	for (i = 0; i < sizeof invalid_aspects / sizeof *invalid_aspects; i++)
-		reject_case("emote count or aspect ratio exceeds limit", tool,
-			    "--invalid-duplicate", invalid_aspects[i], NULL);
-	path = fixture("bad.json", NULL);
+		reject_case(run, "emote count or aspect ratio exceeds limit",
+			    tool, "--invalid-duplicate", invalid_aspects[i],
+			    NULL);
+	path = fixture(run, "bad.json", NULL);
 	for (i = 0; i < sizeof bad_json / sizeof *bad_json; i++) {
 		writefile(path, bad_json[i].text, strlen(bad_json[i].text));
-		reject_case(bad_json[i].error, bullet, "render", source, path,
-			    "--output", invalid, "--font", test_font, NULL);
+		reject_case(run, bad_json[i].error, bullet, "render", source,
+			    path, "--output", invalid, "--font", test_font,
+			    NULL);
 	}
 	/* Include the terminator: a valid JSON prefix must not hide NUL. */
 	writefile(path, twitch, strlen(twitch) + 1);
-	reject_case("NUL byte in JSON input", bullet, "render", source, path,
-		    "--output", invalid, "--font", test_font, NULL);
+	reject_case(run, "NUL byte in JSON input", bullet, "render", source,
+		    path, "--output", invalid, "--font", test_font, NULL);
 	free(path);
 	expect(!exists(invalid), "failed render does not publish an output");
-	run_case(1, bullet, "render", source, chat, "--output", result,
+	run_case(run, 1, bullet, "render", source, chat, "--output", result,
 		 "--force", "--duration", "1", "--hls-start",
 		 "2026-01-01T00:00:00Z", "--font", test_font, NULL);
-	portrait = fixture("portrait.mp4", NULL);
-	run_case(1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+	portrait = fixture(run, "portrait.mp4", NULL);
+	run_case(run, 1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
 		 "color=s=144x256:r=12", "-t", "1", "-vf", "setsar=4/3",
 		 "-c:v", "mpeg4", portrait, NULL);
-	run_case(1, bullet, "render", portrait, chat, "--output", result,
+	run_case(run, 1, bullet, "render", portrait, chat, "--output", result,
 		 "--force", "--duration", "0.5", "--font", test_font, NULL);
-	v = probe(result);
+	v = probe(child, result);
 	expect(v.width == 192 && v.height == 256, "portrait and SAR");
 	free(portrait);
 
 	/* All four image codecs and mixed animated/static rendering, offline.
 	 */
-	dir = fixture("assets", NULL);
+	dir = fixture(run, "assets", NULL);
 	check(SDL_CreateDirectory(dir), "create fixture cache");
 	data = unbase64(gif, &n);
 	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/1/default/dark/2.0",
@@ -1837,29 +2240,29 @@ cli_tests(const char *bullet, const char *tool)
 	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/2/default/dark/2.0",
 		hash);
 	image = format("%s/%s", dir, hash);
-	png = surface(2, 2);
+	png = surface(renderer, 2, 2);
 	memset(png->pixels, 255, (size_t)png->pitch * png->h);
 	io = SDL_IOFromFile(image, "wb");
 	expect(io != NULL && IMG_SavePNG_IO(png, io, true), "PNG fixture");
-	surface_free(png);
-	path = fixture("mixed.json", mixed);
-	run_case(1, bullet, "render", source, path, "--output", result,
+	surface_free(renderer, png);
+	path = fixture(run, "mixed.json", mixed);
+	run_case(run, 1, bullet, "render", source, path, "--output", result,
 		 "--force", "--duration", "1", "--travel-time", "1", "--font",
 		 test_font, NULL);
-	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", result, "-f",
-		 "null", "-", NULL);
-	render_equal(bullet, tool, source, path, test_font, "0", "2", "0.5",
-		     "50", "outline", "30000/1001", "90");
-	render_equal(bullet, tool, source, path, test_font, "0.1", "1.8",
+	run_case(run, 1, "ffmpeg", "-v", "error", "-xerror", "-i", result,
+		 "-f", "null", "-", NULL);
+	render_equal(run, bullet, tool, source, path, test_font, "0", "2",
+		     "0.5", "50", "outline", "30000/1001", "90");
+	render_equal(run, bullet, tool, source, path, test_font, "0.1", "1.8",
 		     "0.5", "100", "shadow", "25", "90");
 	for (i = 0; i < 2; i++) {
-		run_case(1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+		run_case(run, 1, "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
 			 "color=c=red:s=8x8", "-frames:v", "1", "-c:v",
 			 i ? "libwebp" : "mjpeg", "-f", "image2", "-update",
 			 "1", "-y", image, NULL);
-		run_case(1, bullet, "render", source, path, "--output", result,
-			 "--force", "--duration", "0.4", "--font", test_font,
-			 NULL);
+		run_case(run, 1, bullet, "render", source, path, "--output",
+			 result, "--force", "--duration", "0.4", "--font",
+			 test_font, NULL);
 	}
 	free(image);
 	free(path);
@@ -1869,9 +2272,9 @@ cli_tests(const char *bullet, const char *tool)
 		      "\"firstParty\":[{"
 		      "\"id\":\"broken\",\"data\":\"%.*s\"}]}}",
 		      (int)strlen(gif) - 16, gif);
-	path = fixture("bad-gif.json", text);
+	path = fixture(run, "bad-gif.json", text);
 	free(text);
-	run_case(1, bullet, "render", source, path, "--output", result,
+	run_case(run, 1, bullet, "render", source, path, "--output", result,
 		 "--force", "--start", "1", "--duration", "0.5",
 		 "--travel-time", "0.5", "--font", test_font, NULL);
 	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/broken/default/"
@@ -1882,8 +2285,9 @@ cli_tests(const char *bullet, const char *tool)
 	       "invisible malformed embedded GIF stays undecoded");
 	free(other);
 	copyfile(result, saved);
-	reject_case("external command failed", bullet, "render", source, path,
-		    "--output", result, "--force", "--font", test_font, NULL);
+	reject_case(run, "external command failed", bullet, "render", source,
+		    path, "--output", result, "--force", "--font", test_font,
+		    NULL);
 	samebytes(result, saved);
 	free(path);
 	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/broken/default/"
@@ -1894,45 +2298,45 @@ cli_tests(const char *bullet, const char *tool)
 	free(path);
 	free(dir);
 
-	yt = fixture("youtube.data", youtube);
-	tools = fixture("tools.log", NULL);
+	yt = fixture(run, "youtube.data", youtube);
+	tools = fixture(run, "tools.log", NULL);
 	test_env("YT_DLP", tool);
 	test_env("TWITCH_DOWNLOADER_CLI", tool);
 	test_env("BULLET_FIXTURE_VIDEO", source);
 	test_env("BULLET_FIXTURE_CHAT", chat);
 	test_env("BULLET_FIXTURE_YOUTUBE", yt);
 	test_env("BULLET_TOOL_LOG", tools);
-	dir = fixture("youtube", NULL);
-	run_case(1, bullet, "download",
+	dir = fixture(run, "youtube", NULL);
+	run_case(run, 1, bullet, "download",
 		 "https://www.youtube.com/watch?v=fixture", "--dir", dir,
 		 NULL);
 	path = format("%s/fixture.mp4", dir);
 	other = format("%s/fixture.live_chat.json", dir);
 	samebytes(path, source);
-	run_case(1, bullet, "render", path, other, "--output", result,
+	run_case(run, 1, bullet, "render", path, other, "--output", result,
 		 "--force", "--duration", "0.3", "--font", test_font, NULL);
 	free(path);
 	free(other);
 	free(dir);
-	dir = fixture("twitch", NULL);
-	run_case(1, bullet, "download", "https://www.twitch.tv/videos/123",
-		 "--dir", dir, NULL);
+	dir = fixture(run, "twitch", NULL);
+	run_case(run, 1, bullet, "download",
+		 "https://www.twitch.tv/videos/123", "--dir", dir, NULL);
 	path = format("%s/v123.mp4", dir);
-	cached = fixture("tools-before.log", NULL);
+	cached = fixture(run, "tools-before.log", NULL);
 	copyfile(tools, cached);
-	run_case(1, bullet, "download", "https://www.twitch.tv/videos/123",
-		 "--dir", dir, NULL);
+	run_case(run, 1, bullet, "download",
+		 "https://www.twitch.tv/videos/123", "--dir", dir, NULL);
 	samebytes(tools, cached);
 	samebytes(path, source);
 	writefile(path, "truncated", 9);
-	reject_case("external command failed", bullet, "download",
+	reject_case(run, "external command failed", bullet, "download",
 		    "https://www.twitch.tv/videos/123", "--dir", dir, NULL);
 	samebytes(tools, cached);
 	before_entries = 0;
 	check(SDL_EnumerateDirectory(dir, count_entry, &before_entries),
 	      "count files before failed download");
 	test_env("BULLET_TOOL_FAIL", "1");
-	reject_case("test downloader failed", bullet, "download",
+	reject_case(run, "test downloader failed", bullet, "download",
 		    "https://www.twitch.tv/videos/456", "--dir", dir, NULL);
 	other = format("%s/v456.chat.json", dir);
 	expect(!exists(other), "failed downloader does not publish chat");
@@ -1948,13 +2352,14 @@ cli_tests(const char *bullet, const char *tool)
 	other = format("%s/v123.chat.json", dir);
 	samebytes(other, chat);
 	free(other);
-	other = fixture("truncated-before.mp4", "truncated");
+	other = fixture(run, "truncated-before.mp4", "truncated");
 	samebytes(path, other);
 	free(other);
 	test_env("BULLET_TOOL_FAIL", "");
-	reject_case("expected a public HTTPS archive URL", bullet, "download",
-		    "http://www.youtube.com/watch?v=x", "--dir", dir, NULL);
-	reject_case("only YouTube and Twitch archive URLs are supported",
+	reject_case(run, "expected a public HTTPS archive URL", bullet,
+		    "download", "http://www.youtube.com/watch?v=x", "--dir",
+		    dir, NULL);
+	reject_case(run, "only YouTube and Twitch archive URLs are supported",
 		    bullet, "download", "https://example.com/video", "--dir",
 		    dir, NULL);
 	free(yt);
@@ -1967,8 +2372,8 @@ cli_tests(const char *bullet, const char *tool)
 	 * input to exercise broken-pipe cleanup. */
 	test_env(path_key, encoder_path);
 	copyfile(result, saved);
-	reject_case("write failed", bullet, "render", source, chat, "--output",
-		    result, "--force", "--font", test_font, NULL);
+	reject_case(run, "write failed", bullet, "render", source, chat,
+		    "--output", result, "--force", "--font", test_font, NULL);
 	samebytes(result, saved);
 	test_env(path_key, oldpath);
 	free(path_key);
@@ -1987,9 +2392,9 @@ cli_tests(const char *bullet, const char *tool)
 	free(result);
 	free(saved);
 	free(invalid);
-	check(SDL_EnumerateDirectory(workdir, remove_entry, NULL),
+	check(SDL_EnumerateDirectory(work->directory, remove_entry, NULL),
 	      "clean CLI fixtures");
-	endwork();
+	endwork(work, cache);
 	printf("cli: %u native process checks passed; inputs unchanged\n",
 	       cli_checks);
 }
@@ -1997,6 +2402,7 @@ cli_tests(const char *bullet, const char *tool)
 int
 main(int argc, char **argv)
 {
+	App *run = &app;
 	int mode;
 
 	atexit(cleanup);
@@ -2008,18 +2414,37 @@ main(int argc, char **argv)
 		    *SDL_getenv("BULLET_REFERENCE_ENCODER") &&
 		    (!SDL_strcasecmp(basenameof(argv[0]), "ffmpeg") ||
 		     !SDL_strcasecmp(basenameof(argv[0]), "ffmpeg.exe"))) {
-			reference_ffmpeg(argc, argv);
+			reference_ffmpeg(run, argc, argv);
 			return 0;
 		}
 		if (argc == 3 && !strcmp(argv[1], "--invalid-duplicate")) {
-			asset("https://example.com/duplicate.png", 2);
-			asset("https://example.com/duplicate.png",
+			asset(&app.chat, "https://example.com/duplicate.png",
+			      2);
+			asset(&app.chat, "https://example.com/duplicate.png",
 			      strtod(argv[2], NULL));
-			freechat();
+			freechat(&app.chat, &app.renderer);
+			return 0;
+		}
+		if (!strcmp(argv[1], "--replacement-oom"))
+			replacement_oom(run);
+		if (!strcmp(argv[1], "--held-cross-exit"))
+			held_cross_exit();
+		if (!strcmp(argv[1], "--cross-cleanup-retry")) {
+			cross_cleanup_retry();
+			return 0;
+		}
+		if (!strcmp(argv[1], "--owners")) {
+			lane_tests();
+			plan_tests();
+			replan_tests(run);
+			return 0;
+		}
+		if (!strcmp(argv[1], "--replan")) {
+			replan_tests(run);
 			return 0;
 		}
 		if (!strcmp(argv[1], "--width-geometry")) {
-			width_geometry_tests();
+			width_geometry_tests(run);
 			return 0;
 		}
 		if (!strcmp(argv[1], "--version")) {
@@ -2027,7 +2452,7 @@ main(int argc, char **argv)
 			return 0;
 		}
 		if (argc == 3 && !strcmp(argv[1], "--cli")) {
-			cli_tests(argv[2], argv[0]);
+			cli_tests(run, argv[2], argv[0]);
 			return 0;
 		}
 		if (!strcmp(argv[1], "chatdownload") ||
@@ -2040,16 +2465,22 @@ main(int argc, char **argv)
 			return 0;
 		}
 		if (!strcmp(argv[1], "--dense-render")) {
-			dense_reference = 1;
+			app.renderer.dense_reference = 1;
 			argv[1] = "render";
 		}
-		mode = arguments(argc, argv);
+		mode = arguments(&app.options, &app.inferred_chat,
+				 &app.inferred_output, argc, argv);
 		if (mode == 1)
-			download();
+			download(&app.options, &app.chat, &app.renderer,
+				 &app.work, &app.cache_stage, &app.child);
 		else
-			render();
+			render(&app.options, &app.chat, &app.glyphs,
+			       &app.renderer, &app.work, &app.cache_stage,
+			       &app.child);
 		return 0;
 	}
-	tests();
+	cross_cleanup_retry();
+	replacement_tests(run);
+	tests(run);
 	return 0;
 }
