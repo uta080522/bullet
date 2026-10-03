@@ -2888,8 +2888,8 @@ cli_tests(App *run, const char *bullet, const char *tool)
 	cross_cache_tests(run, bullet, source, original, test_font);
 	run_case(run, 1, bullet, "--help", NULL);
 	text = capture(child, version);
-	expect(!strcmp(text, "bullet 0.1.0\n") ||
-		   !strcmp(text, "bullet 0.1.0\r\n"),
+	expect(!strcmp(text, "bullet 0.1.1\n") ||
+		   !strcmp(text, "bullet 0.1.1\r\n"),
 	       "CLI reports the release version");
 	free(text);
 	auto_video = fixture(run, "auto.mp4", NULL);

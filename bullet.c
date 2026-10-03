@@ -2723,7 +2723,7 @@ main(int argc, char **argv)
 		}
 	}
 	if (argc == 2 && !strcmp(argv[1], "--version")) {
-		puts("bullet 0.1.0");
+		puts("bullet 0.1.1");
 		return 0;
 	}
 	atexit(cleanup);
