@@ -1533,8 +1533,8 @@ cache_write_observe(void)
 		   p->native_closes == 1 && !p->real && !p->wrapper &&
 		   !payload && !directory && !asset_temp && !work_directory &&
 		   !app.cache_stage.directory && !app.cache_stage.payload &&
-		   !app.work.directory && !app.work.asset_temp &&
-		   !app.chat.assets && !app.child &&
+		   !app.cache_stage.file && !app.work.directory &&
+		   !app.work.asset_temp && !app.chat.assets && !app.child &&
 		   app.renderer.retained.bytes == 0 && preserved &&
 		   p->partial == p->scenario->write_error &&
 		   p->injected_write == p->scenario->write_error &&
@@ -3231,7 +3231,8 @@ fixture_empty(const App *run)
 		   !run->work.asset_temp && !run->work.logpath &&
 		   !run->work.log,
 	       "fixture work paths and log owners empty");
-	expect(!run->cache_stage.directory && !run->cache_stage.payload,
+	expect(!run->cache_stage.directory && !run->cache_stage.payload &&
+		   !run->cache_stage.file,
 	       "fixture cache stage owners empty");
 	expect(!run->child && !run->inferred_chat && !run->inferred_output &&
 		   !run->chat_context && !cross_fixture &&
@@ -3359,7 +3360,10 @@ fixture_ownership_tests(App *run)
 	run->cache_stage.directory = private_directory(run->work.directory);
 	run->cache_stage.payload =
 	    format("%s/payload", run->cache_stage.directory);
-	writefile(run->cache_stage.payload, "cache", 5);
+	run->cache_stage.file = SDL_IOFromFile(run->cache_stage.payload, "wb");
+	check(run->cache_stage.file != NULL,
+	      "create owned boundary cache file");
+	writeall(run->cache_stage.file, "cache", 5);
 	m = message(&run->chat, 123456);
 	part(&run->chat, m, "owned boundary text", NONE);
 	m->sprite = resize(NULL, 1, sizeof *m->sprite);

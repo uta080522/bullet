@@ -110,6 +110,7 @@ typedef struct {
 
 typedef struct {
 	char *directory, *payload;
+	SDL_IOStream *file;
 } CacheStage;
 
 typedef struct {
@@ -580,6 +581,16 @@ freechat(Chat *chat, Renderer *renderer)
 static int
 end_cache_stage(CacheStage *cache)
 {
+	SDL_IOStream *file = cache->file;
+	int ok = 1;
+
+	cache->file = NULL;
+	if (file && !SDL_CloseIO(file)) {
+		fprintf(stderr,
+			"bullet: cannot close private cache payload: %s\n",
+			SDL_GetError());
+		ok = 0;
+	}
 	if (cache->payload && !SDL_RemovePath(cache->payload) &&
 	    exists(cache->payload))
 		return 0;
@@ -588,7 +599,7 @@ end_cache_stage(CacheStage *cache)
 	free(cache->payload);
 	free(cache->directory);
 	cache->payload = cache->directory = NULL;
-	return 1;
+	return ok;
 }
 
 static void
@@ -601,7 +612,7 @@ endwork(OutputWork *work, CacheStage *cache)
 				SDL_GetError());
 		work->log = NULL;
 	}
-	if (!end_cache_stage(cache))
+	if (!end_cache_stage(cache) && cache->directory)
 		fprintf(stderr,
 			"bullet: cannot remove private cache staging: %s\n",
 			cache->directory);
@@ -1641,11 +1652,16 @@ load_asset(Renderer *renderer, int emote_height, OutputWork *work,
 	if (!a->count)
 		die("emote has no frames: %s", a->url);
 	if (!cached) {
-		if (cache->directory || cache->payload)
+		if (cache->directory || cache->payload || cache->file)
 			die("private cache stage is already active");
 		cache->directory = private_directory(directory);
 		cache->payload = format("%s/asset", cache->directory);
-		writefile(cache->payload, bytes, length);
+		cache->file = SDL_IOFromFile(cache->payload, "wb");
+		check(cache->file != NULL, cache->payload);
+		writeall(cache->file, bytes, length);
+		io = cache->file;
+		cache->file = NULL;
+		check(SDL_CloseIO(io), "close output");
 		if (!commitfile(cache->payload, path, 0))
 			die("cannot commit emote cache without overwriting: "
 			    "%s",
