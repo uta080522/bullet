@@ -31,6 +31,8 @@ Use `--font` to select a font, `--force` to replace an existing output, and `bul
 
 Emote verification uses private scratch files beside the output. New cache entries keep the original validated encoded bytes and use private staging inside `assets/`, so the cache and output can be on different filesystems. Existing cache entries require no cache writes and can be read-only.
 
+For each emote URL, the first valid aspect ratio in the chat metadata determines its width at the render's emote height, rounded to at least one pixel. Later valid metadata for the same URL does not change that width. Invalid aspect ratios are rejected even for repeated URLs. Static images and every GIF frame are resized to this width and emote height, regardless of the encoded image dimensions. Only visible emotes are decoded.
+
 Scrolling text, images and GIFs use subpixel positioning to reduce jitter from whole-pixel rounding. Their timing and crossing speed are unchanged.
 
 ## Building

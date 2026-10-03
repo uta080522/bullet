@@ -485,6 +485,174 @@ frame_bounds_tests(void)
 }
 
 static void
+width_geometry_tests(void)
+{
+	SDL_Surface *source;
+	Message *m;
+	size_t index;
+	int decoded_width, decoded_height;
+
+	emote_height = 4;
+	lane_height = 6;
+	gap = 2;
+	font_size = 4;
+	opt.travel = SECOND;
+	index = asset("https://example.com/wide.png", 2);
+	m = message(123456);
+	part(m, "", index);
+	part(m, "", index);
+	expect(layout(20, 6) == 0, "image-only width scene has a free lane");
+	expect(m->parts[0].x == 0 && m->parts[0].width == 8 &&
+		   m->parts[1].x == 10 && m->parts[1].width == 8 &&
+		   m->width == 18 && m->time == 123456,
+	       "aspect two measures literal positions and preserves time");
+	source = surface(2, 2);
+	asset_frame(&assets[index], source, 100);
+	decoded_width = assets[index].frames[0]->w;
+	decoded_height = assets[index].frames[0]->h;
+	surface_free(source);
+	freechat();
+	expect(decoded_width == 8 && decoded_height == 4,
+	       "square RGBA source normalizes to metadata width eight");
+
+	index = asset("https://example.com/tiny.png", 0.01);
+	m = message(654321);
+	part(m, "", index);
+	part(m, "", index);
+	layout(20, 6);
+	expect(m->parts[0].x == 0 && m->parts[0].width == 1 &&
+		   m->parts[1].x == 3 && m->parts[1].width == 1 &&
+		   m->width == 4 && m->time == 654321,
+	       "tiny positive aspect measures width one and preserves time");
+	source = surface(2, 2);
+	asset_frame(&assets[index], source, 100);
+	decoded_width = assets[index].frames[0]->w;
+	decoded_height = assets[index].frames[0]->h;
+	surface_free(source);
+	freechat();
+	expect(decoded_width == 1 && decoded_height == 4,
+	       "tiny positive aspect decodes to width one");
+	memset(&opt, 0, sizeof opt);
+	puts("unit: canonical width geometry OK");
+}
+
+static void
+asset_metadata_tests(void)
+{
+	cJSON *json;
+	char *url;
+	size_t i, index;
+
+	json = parsejson(
+	    "{\"embeddedData\":{\"firstParty\":[{\"id\":\"wide\","
+	    "\"width\":4,\"height\":2,\"data\":\"\"}]},\"comments\":[{"
+	    "\"content_offset_seconds\":0.25,\"message\":{\"fragments\":[{"
+	    "\"emoticon\":{\"emoticon_id\":\"wide\"}}]}}]}");
+	read_twitch(json);
+	cJSON_Delete(json);
+	expect(nassets == 1 && assets[0].aspect == 2,
+	       "Twitch first-party aspect precedes fragment fallback one");
+	expect(asset(assets[0].url, 3) == 0 && assets[0].aspect == 2,
+	       "later valid metadata retains first-seen aspect");
+	emote_height = 4;
+	lane_height = 6;
+	gap = 2;
+	font_size = 4;
+	opt.travel = SECOND;
+	layout(20, 6);
+	expect(messages[0].parts[0].x == 0 &&
+		   messages[0].parts[0].width == 8 && messages[0].width == 8 &&
+		   messages[0].time == 250000,
+	       "first-seen aspect determines literal message geometry");
+	freechat();
+	for (i = 0; i < MAX_ASSETS; i++) {
+		url = format("https://example.com/capacity/%zu", i);
+		index = asset(url, 2);
+		free(url);
+		expect(index == i, "distinct URLs fill the asset capacity");
+	}
+	expect(asset("https://example.com/capacity/0", 1) == 0 &&
+		   asset("https://example.com/capacity/4095", 3) == 4095 &&
+		   nassets == 4096 && assets[0].aspect == 2 &&
+		   assets[4095].aspect == 2,
+	       "valid existing URLs remain usable at full capacity");
+	freechat();
+	memset(&opt, 0, sizeof opt);
+}
+
+static void
+width_decode_tests(void)
+{
+	const double aspects[] = {2, 0.01};
+	const int widths[] = {8, 1};
+	SDL_Surface *source;
+	SDL_IOStream *io;
+	Message *m;
+	Asset *a;
+	char hash[65], *path;
+	size_t i, j, index;
+
+	emote_height = 4;
+	lane_height = 6;
+	gap = 2;
+	font_size = 4;
+	opt.travel = SECOND;
+	for (i = 0; i < 2; i++) {
+		index = asset("https://example.com/width.gif", aspects[i]);
+		assets[index].embedded = copystr(gif);
+		m = message(123456);
+		part(m, "", index);
+		layout(20, 6);
+		a = &assets[index];
+		load_asset(a, workdir);
+		expect(a->count == 2,
+		       "canonical width decodes two real GIF frames");
+		for (j = 0; j < 2; j++)
+			expect(a->frames[j]->w == widths[i] &&
+				   a->frames[j]->h == 4,
+			       "every GIF frame uses canonical metadata "
+			       "dimensions");
+		expect(a->ends[0] == 100000 && a->ends[1] == 300000 &&
+			   m->parts[0].x == 0 &&
+			   m->parts[0].width == widths[i] &&
+			   m->width == widths[i] && m->time == 123456,
+		       "GIF normalization preserves frame delays and message "
+		       "time");
+		hashurl(a->url, hash);
+		path = format("%s/%s", workdir, hash);
+		check(SDL_RemovePath(path), "remove owned width GIF cache");
+		free(path);
+		freechat();
+
+		index = asset("https://example.com/width.png", aspects[i]);
+		m = message(654321);
+		part(m, "", index);
+		layout(20, 6);
+		hashurl(assets[index].url, hash);
+		path = format("%s/%s", workdir, hash);
+		source = surface(2, 2);
+		memset(source->pixels, 255, (size_t)source->pitch * source->h);
+		io = SDL_IOFromFile(path, "wb");
+		expect(io != NULL && IMG_SavePNG_IO(source, io, true),
+		       "write owned square PNG width fixture");
+		surface_free(source);
+		load_asset(&assets[index], workdir);
+		a = &assets[index];
+		expect(a->count == 1 && a->frames[0]->w == widths[i] &&
+			   a->frames[0]->h == 4 && m->parts[0].x == 0 &&
+			   m->parts[0].width == widths[i] &&
+			   m->width == widths[i] && m->time == 654321,
+		       "square PNG uses literal canonical width and preserves "
+		       "time");
+		check(SDL_RemovePath(path), "remove owned width PNG cache");
+		free(path);
+		freechat();
+	}
+	memset(&opt, 0, sizeof opt);
+	puts("unit: canonical PNG and GIF dimensions OK");
+}
+
+static void
 asset_frame_tests(void)
 {
 	Asset a = {0};
@@ -496,6 +664,7 @@ asset_frame_tests(void)
 
 	before = surface_bytes;
 	emote_height = 4;
+	a.target_width = 4;
 	for (size = 2; size <= 4; size += 2) {
 		source = surface(size, size);
 		for (y = 0; y < size; y++) {
@@ -644,6 +813,8 @@ tests(void)
 	sprite_tests();
 	subpixel_motion_tests();
 	frame_bounds_tests();
+	width_geometry_tests();
+	asset_metadata_tests();
 	asset_frame_tests();
 	rate("30000/1001", &num, &den);
 	expect(num == 30000 && den == 1001, "rational fps");
@@ -690,6 +861,7 @@ tests(void)
 	free(destination);
 	stage = format("%s/chat.json", workdir);
 	cache_cleanup_tests();
+	width_decode_tests();
 	writefile(stage, youtube, strlen(youtube));
 	readchat(stage);
 	expect(nmessages == 1 && messages[0].time == 2 * SECOND,
@@ -717,6 +889,7 @@ tests(void)
 	openfont(200, 80);
 	index = asset("https://example.com/animated.gif", 1);
 	assets[index].embedded = copystr(gif);
+	assets[index].target_width = emote_height;
 	load_asset(&assets[index], workdir);
 	expect(assets[index].count == 2, "decode complete GIF");
 	pixel = frame_at(&assets[index], 50000)->pixels;
@@ -747,6 +920,7 @@ tests(void)
 	cropped_frame_test(4850000);
 	freechat();
 	index = asset("https://example.com/animated.gif", 1);
+	assets[index].target_width = emote_height;
 	load_asset(&assets[index], workdir);
 	expect(assets[index].count == 2, "offline GIF cache reuse");
 	hashurl(assets[index].url, hash);
@@ -1391,7 +1565,13 @@ cli_tests(const char *bullet, const char *tool)
 	    {"{\"comments\":[]}", "no text or emoji messages found"},
 	    {"{\"comments\":[{\"content_offset_seconds\":-1,"
 	     "\"message\":{\"body\":\"bad\"}}]}",
-	     "time is outside 0..7 days"}};
+	     "time is outside 0..7 days"},
+	    {"{\"comments\":[],\"embeddedData\":{\"firstParty\":[{"
+	     "\"id\":\"duplicate\",\"width\":4,\"height\":2,\"data\":\"\"},{"
+	     "\"id\":\"duplicate\",\"width\":514,\"height\":2,\"data\":\"\"}]}"
+	     "}",
+	     "emote count or aspect ratio exceeds limit"}};
+	const char *invalid_aspects[] = {"0", "-1", "257", "nan", "inf"};
 	const char *twitch = "{\"FileInfo\" : {},\"comments\":[{"
 			     "\"content_offset_seconds\":0,"
 			     "\"created_at\":\"2026-01-01T00:00:00.5Z\","
@@ -1615,6 +1795,9 @@ cli_tests(const char *bullet, const char *tool)
 		reject_case(bad_options[i].error, bullet, "render", source,
 			    chat, "--output", invalid, bad_options[i].key,
 			    bad_options[i].value, NULL);
+	for (i = 0; i < sizeof invalid_aspects / sizeof *invalid_aspects; i++)
+		reject_case("emote count or aspect ratio exceeds limit", tool,
+			    "--invalid-duplicate", invalid_aspects[i], NULL);
 	path = fixture("bad.json", NULL);
 	for (i = 0; i < sizeof bad_json / sizeof *bad_json; i++) {
 		writefile(path, bad_json[i].text, strlen(bad_json[i].text));
@@ -1688,6 +1871,16 @@ cli_tests(const char *bullet, const char *tool)
 		      (int)strlen(gif) - 16, gif);
 	path = fixture("bad-gif.json", text);
 	free(text);
+	run_case(1, bullet, "render", source, path, "--output", result,
+		 "--force", "--start", "1", "--duration", "0.5",
+		 "--travel-time", "0.5", "--font", test_font, NULL);
+	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/broken/default/"
+		"dark/2.0",
+		hash);
+	other = format("%s/%s", dir, hash);
+	expect(!exists(other),
+	       "invisible malformed embedded GIF stays undecoded");
+	free(other);
 	copyfile(result, saved);
 	reject_case("external command failed", bullet, "render", source, path,
 		    "--output", result, "--force", "--font", test_font, NULL);
@@ -1816,6 +2009,17 @@ main(int argc, char **argv)
 		    (!SDL_strcasecmp(basenameof(argv[0]), "ffmpeg") ||
 		     !SDL_strcasecmp(basenameof(argv[0]), "ffmpeg.exe"))) {
 			reference_ffmpeg(argc, argv);
+			return 0;
+		}
+		if (argc == 3 && !strcmp(argv[1], "--invalid-duplicate")) {
+			asset("https://example.com/duplicate.png", 2);
+			asset("https://example.com/duplicate.png",
+			      strtod(argv[2], NULL));
+			freechat();
+			return 0;
+		}
+		if (!strcmp(argv[1], "--width-geometry")) {
+			width_geometry_tests();
 			return 0;
 		}
 		if (!strcmp(argv[1], "--version")) {

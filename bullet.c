@@ -58,7 +58,7 @@ typedef struct {
 	SDL_Surface **frames;
 	int64_t *ends;
 	size_t count;
-	int needed;
+	int needed, target_width;
 } Asset;
 
 typedef struct {
@@ -967,11 +967,12 @@ asset(const char *url, double aspect)
 
 	if (strncmp(url, "https://", 8) || strlen(url) > 8192)
 		die("invalid HTTPS emote URL");
+	if (!isfinite(aspect) || aspect <= 0 || aspect > 256)
+		die("emote count or aspect ratio exceeds limit");
 	for (i = 0; i < nassets; i++)
 		if (!strcmp(url, assets[i].url))
 			return i;
-	if (nassets == MAX_ASSETS || !isfinite(aspect) || aspect <= 0 ||
-	    aspect > 256)
+	if (nassets == MAX_ASSETS)
 		die("emote count or aspect ratio exceeds limit");
 	assets = resize(assets, nassets + 1, sizeof *assets);
 	memset(&assets[nassets], 0, sizeof *assets);
@@ -1397,21 +1398,17 @@ static void
 asset_frame(Asset *a, SDL_Surface *source, uint64_t delay_ms)
 {
 	SDL_Surface *rgba, *out;
-	int width;
 	int64_t end;
 
 	if (a->count == MAX_FRAMES || delay_ms > 86400000)
 		die("emote frame count or duration exceeds limit");
-	width = (int)round((double)emote_height * source->w / source->h);
-	if (width < 1)
-		width = 1;
-	surface_limit(width, emote_height);
+	surface_limit(a->target_width, emote_height);
 	rgba = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
 	check(rgba != NULL, "convert emote pixels");
 	/* Own the resized pixels directly; no second surface and row copy. */
 	out = rgba;
-	if (rgba->w != width || rgba->h != emote_height) {
-		out = SDL_ScaleSurface(rgba, width, emote_height,
+	if (rgba->w != a->target_width || rgba->h != emote_height) {
+		out = SDL_ScaleSurface(rgba, a->target_width, emote_height,
 				       SDL_SCALEMODE_LINEAR);
 		check(out != NULL, "resize emote");
 		SDL_DestroySurface(rgba);
@@ -1701,8 +1698,10 @@ layout(int width, int height)
 	size_t *heads;
 	Message *m, *old;
 	Part *p;
+	Asset *a;
 	int text_height, position, safe;
-	double speed, old_speed, right, furthest, best, clearance;
+	double speed, old_speed, right, furthest, best, clearance,
+	    target_width;
 
 	lanes = (size_t)(height / lane_height);
 	if (!lanes)
@@ -1725,8 +1724,18 @@ layout(int width, int height)
 				      "measure text");
 				p->width += 2 * outline;
 			} else {
-				p->width = (int)round(emote_height *
-						      assets[p->asset].aspect);
+				a = &assets[p->asset];
+				if (!a->target_width) {
+					target_width =
+					    round(emote_height * a->aspect);
+					if (target_width > 65530)
+						die("comment is too wide");
+					a->target_width =
+					    target_width < 1
+						? 1
+						: (int)target_width;
+				}
+				p->width = a->target_width;
 			}
 			if (p->width < 0 || p->width > 65530 - position - gap)
 				die("comment is too wide");
