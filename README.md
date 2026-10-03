@@ -33,6 +33,8 @@ Emote verification uses private scratch files beside the output. New cache entri
 
 For each emote URL, the first valid aspect ratio in the chat metadata determines its width at the render's emote height, rounded to at least one pixel. Later valid metadata for the same URL does not change that width. Invalid aspect ratios are rejected even for repeated URLs. Static images and every GIF frame are resized to this width and emote height, regardless of the encoded image dimensions. Only visible emotes are decoded.
 
+Retained image storage is limited to 512 MiB. It includes the canvas, normalized emote frames, dense text sprites, and packed sprite runs with their headers. Surface charges use the actual row pitch times height, including padding. Decoder, conversion, and text-rasterization temporaries have dimension limits but are excluded from this storage count, as are encoded bytes, metadata, and library allocations. This is not a process-wide or temporary-inclusive peak memory guarantee.
+
 Scrolling text, images and GIFs use subpixel positioning to reduce jitter from whole-pixel rounding. Their timing and crossing speed are unchanged.
 
 ## Building

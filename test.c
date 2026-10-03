@@ -195,11 +195,11 @@ reference_subpixel_paste(App *run, SDL_Surface *to, const SDL_Surface *from,
 	const unsigned char clear[4] = {0};
 	const unsigned char *a, *b, *row;
 	unsigned char *p;
-	SDL_Surface *sample;
+	SDL_Surface *sample = NULL;
 	double position, fraction, alpha, value;
 	int dx, dy, sx, sy, c;
 
-	sample = surface(renderer, to->w, to->h);
+	surface_create(renderer, &sample, to->w, to->h);
 	for (dy = 0; dy < to->h; dy++) {
 		sy = dy - y;
 		if (sy < 0 || sy >= from->h)
@@ -227,7 +227,7 @@ reference_subpixel_paste(App *run, SDL_Surface *to, const SDL_Surface *from,
 		}
 	}
 	reference_paste(to, sample, 0, 0);
-	surface_free(renderer, sample);
+	surface_destroy(renderer, &sample);
 }
 
 static void
@@ -244,18 +244,291 @@ surfaces_equal(const SDL_Surface *a, const SDL_Surface *b)
 }
 
 static void
+storage_tests(App *run)
+{
+	Renderer *renderer = &run->renderer;
+	Chat *chat = &run->chat;
+	SDL_Surface *temporary, *converted, *padded, *rejected;
+	unsigned char rows[32] = {0};
+	Message *m;
+	Asset *a;
+	size_t index;
+
+	expect(renderer->retained.bytes == 0, "empty retained image storage");
+	temporary = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
+	check(temporary != NULL, "create uncharged temporary fixture");
+	memset(temporary->pixels, 255, 16);
+	renderer->retained.bytes = MAX_MEMORY;
+	expect(image_dimensions(temporary->w, temporary->h),
+	       "temporary dimensions are valid at full retained capacity");
+	converted = SDL_ConvertSurface(temporary, SDL_PIXELFORMAT_RGBA32);
+	check(converted != NULL, "convert uncharged temporary fixture");
+	expect(renderer->retained.bytes == MAX_MEMORY &&
+		   !memcmp(temporary->pixels, converted->pixels, 16),
+	       "temporary conversion is excluded and preserves source pixels");
+	rejected = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
+	check(rejected != NULL, "create rejected adoption fixture");
+	rejected->refcount++;
+	expect(!surface_take_new(renderer, &renderer->canvas, rejected) &&
+		   !renderer->canvas && rejected->refcount == 1 &&
+		   renderer->retained.bytes == MAX_MEMORY,
+	       "capacity rejection destroys new reference without changing "
+	       "owner");
+	SDL_DestroySurface(rejected);
+	expect(!image_charge(&renderer->retained, SIZE_MAX) &&
+		   renderer->retained.bytes == MAX_MEMORY,
+	       "oversized charge cannot wrap full storage");
+	renderer->retained.bytes = 0;
+	SDL_DestroySurface(converted);
+
+	rejected = SDL_CreateSurface(65537, 1, SDL_PIXELFORMAT_RGBA32);
+	check(rejected != NULL, "create bounded oversized dimension fixture");
+	expect(!image_dimensions(rejected->w, rejected->h),
+	       "actual temporary wider than 65536 fails the dimension bound");
+	expect(!surface_take_new(renderer, &renderer->canvas, rejected) &&
+		   !renderer->canvas && renderer->retained.bytes == 0,
+	       "invalid dimension adoption leaves no retained storage");
+
+	padded = SDL_CreateSurfaceFrom(3, 2, SDL_PIXELFORMAT_RGBA32, rows, 16);
+	check(padded != NULL, "create actual padded pitch fixture");
+	expect(padded->pitch == 16 && padded->w == 3 && padded->h == 2,
+	       "padded fixture has twelve visible bytes in each sixteen-byte "
+	       "row");
+	renderer->retained.bytes = MAX_MEMORY - 24;
+	padded->refcount++;
+	expect(!surface_take_new(renderer, &renderer->canvas, padded) &&
+		   !renderer->canvas && padded->refcount == 1 &&
+		   renderer->retained.bytes == MAX_MEMORY - 24,
+	       "twenty-four spare bytes cannot fit thirty-two actual padded "
+	       "bytes");
+	renderer->retained.bytes = 0;
+	expect(!image_charge(&renderer->retained, SIZE_MAX) &&
+		   renderer->retained.bytes == 0,
+	       "oversized charge cannot wrap empty storage");
+	expect(
+	    surface_take_new(renderer, &renderer->canvas, padded) &&
+		renderer->retained.bytes == 32,
+	    "canvas adoption charges thirty-two bytes including row padding");
+	expect(!surface_take_new(renderer, &renderer->canvas, padded) &&
+		   renderer->canvas == padded &&
+		   renderer->retained.bytes == 32,
+	       "same-owner readoption cannot destroy or double-charge pixels");
+	rejected = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
+	check(rejected != NULL, "create occupied-owner rejection fixture");
+	rejected->refcount++;
+	expect(!surface_take_new(renderer, &renderer->canvas, rejected) &&
+		   rejected->refcount == 1 && renderer->canvas == padded &&
+		   renderer->retained.bytes == 32,
+	       "occupied owner rejects and destroys only the new reference");
+	SDL_DestroySurface(rejected);
+	surface_destroy(renderer, &renderer->canvas);
+	expect(!renderer->canvas && renderer->retained.bytes == 0,
+	       "canvas destruction releases the same thirty-two bytes");
+	surface_create(renderer, &renderer->canvas, 2, 2);
+	expect(renderer->canvas->pitch == 8 && renderer->retained.bytes == 16,
+	       "created canvas charges its sixteen-byte actual footprint");
+	surface_destroy(renderer, &renderer->canvas);
+	surface_destroy(renderer, &renderer->canvas);
+	expect(renderer->retained.bytes == 0,
+	       "empty canvas destruction cannot subtract twice");
+
+	index = asset(chat, "https://example.com/storage.png", 1);
+	a = &chat->assets[index];
+	a->target_width = 2;
+	asset_frame(renderer, 2, a, temporary, 100);
+	expect(a->count == 1 && a->ends[0] == 100000 &&
+		   a->frames[0]->pitch == 8 &&
+		   renderer->retained.bytes == 16 &&
+		   !memcmp(temporary->pixels, a->frames[0]->pixels, 16),
+	       "first normalized frame charges sixteen bytes without charging "
+	       "source");
+	asset_frame(renderer, 2, a, temporary, 200);
+	expect(
+	    a->count == 2 && a->ends[1] == 300000 &&
+		renderer->retained.bytes == 32,
+	    "second normalized frame adds sixteen bytes and keeps its delay");
+	freechat(chat, renderer);
+	expect(renderer->retained.bytes == 0,
+	       "chat destruction releases every retained frame");
+	SDL_DestroySurface(temporary);
+
+	m = message(chat, 0);
+	m->sprite = resize(NULL, 1, sizeof *m->sprite);
+	memset(m->sprite, 0, sizeof *m->sprite);
+	surface_create(renderer, &m->sprite->pixels, 8, 2);
+	expect(renderer->retained.bytes == 64,
+	       "dense sprite charges sixty-four bytes");
+	((unsigned char *)m->sprite->pixels->pixels)[3] = 255;
+	sprite_pack(renderer, m->sprite);
+	expect(!m->sprite->pixels && m->sprite->bytes == 16 &&
+		   renderer->retained.bytes == 16,
+	       "one packed pixel and twelve-byte header replace sixty-four "
+	       "bytes");
+	sprite_pack(renderer, m->sprite);
+	expect(renderer->retained.bytes == 16 && m->sprite->bytes == 16,
+	       "already-packed sprite is unchanged");
+	freechat(chat, renderer);
+	expect(renderer->retained.bytes == 0,
+	       "packed sprite destruction releases header");
+
+	m = message(chat, 0);
+	m->sprite = resize(NULL, 1, sizeof *m->sprite);
+	memset(m->sprite, 0, sizeof *m->sprite);
+	surface_create(renderer, &m->sprite->pixels, 8, 2);
+	sprite_pack(renderer, m->sprite);
+	expect(!m->sprite->pixels && !m->sprite->runs && !m->sprite->bytes &&
+		   renderer->retained.bytes == 0,
+	       "empty packing releases all sixty-four dense bytes");
+	freechat(chat, renderer);
+
+	m = message(chat, 0);
+	m->sprite = resize(NULL, 1, sizeof *m->sprite);
+	memset(m->sprite, 0, sizeof *m->sprite);
+	surface_create(renderer, &m->sprite->pixels, 8, 2);
+	((unsigned char *)m->sprite->pixels->pixels)[3] = 255;
+	renderer->retained.bytes = MAX_MEMORY - 15;
+	sprite_pack(renderer, m->sprite);
+	expect(m->sprite->pixels && !m->sprite->runs && !m->sprite->bytes &&
+		   renderer->retained.bytes == MAX_MEMORY - 15,
+	       "fifteen spare bytes cannot fit a sixteen-byte run and keep "
+	       "dense pixels");
+	renderer->retained.bytes = 64;
+	sprite_pack(renderer, m->sprite);
+	expect(!m->sprite->pixels && m->sprite->bytes == 16 &&
+		   renderer->retained.bytes == 16,
+	       "restored capacity permits dense-to-packed replacement");
+	freechat(chat, renderer);
+	expect(renderer->retained.bytes == 0,
+	       "all retained owners are destroyed without resetting storage");
+	puts("unit: retained storage literal bytes, padded pitch, rejection "
+	     "and release OK");
+}
+
+static size_t release_mismatch_bytes;
+
+static void
+release_mismatch_cleanup(void)
+{
+	cleanup();
+	if (app.chat.messages || app.chat.assets || app.chat.nmessages ||
+	    app.chat.nassets || app.chat.nparts || app.renderer.canvas ||
+	    app.inferred_chat || app.inferred_output ||
+	    app.renderer.retained.bytes != release_mismatch_bytes) {
+		fputs("test failed: mismatch teardown left owners or changed "
+		      "ledger\n",
+		      stderr);
+		_Exit(90);
+	}
+	fprintf(
+	    stderr,
+	    "unit: mismatch teardown cleared all owners, retained %zu bytes\n",
+	    release_mismatch_bytes);
+}
+
+static void
+release_mismatch(App *run, int packed, int invalid, int on_exit)
+{
+	Renderer *renderer = &run->renderer;
+	Chat *chat = &run->chat;
+	SDL_Surface *source;
+	Message *m;
+	Asset *a;
+	size_t i;
+
+	for (i = 0; i < 2; i++) {
+		m = message(chat, (int64_t)i);
+		m->parts = resize(NULL, 1, sizeof *m->parts);
+		m->parts[0].text = copystr("owned mismatch fixture");
+		m->parts[0].asset = NONE;
+		m->count = 1;
+		chat->nparts++;
+		m->sprite = resize(NULL, 1, sizeof *m->sprite);
+		memset(m->sprite, 0, sizeof *m->sprite);
+		surface_create(renderer, &m->sprite->pixels, 8, 2);
+		((unsigned char *)m->sprite->pixels->pixels)[3] = 255;
+		if (packed)
+			sprite_pack(renderer, m->sprite);
+		expect(packed ? !m->sprite->pixels && m->sprite->runs &&
+				    m->sprite->bytes == 16
+			      : m->sprite->pixels && !m->sprite->runs,
+		       "mismatch fixture owns the requested sprite form");
+	}
+	a = &chat->assets[asset(chat, "https://example.com/mismatch.png", 1)];
+	a->target_width = 2;
+	a->embedded = copystr("owned encoded fixture");
+	source = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
+	check(source != NULL, "create mismatch source");
+	asset_frame(renderer, 2, a, source, 100);
+	asset_frame(renderer, 2, a, source, 200);
+	SDL_DestroySurface(source);
+	surface_create(renderer, &renderer->canvas, 2, 2);
+	run->inferred_chat = copystr("owned chat path fixture");
+	run->inferred_output = copystr("owned output path fixture");
+	expect(renderer->retained.bytes == (packed ? 80 : 176),
+	       "mismatch fixture has the literal total footprint");
+	release_mismatch_bytes = invalid ? MAX_MEMORY + 1 : 1;
+	renderer->retained.bytes = release_mismatch_bytes;
+	expect(atexit(release_mismatch_cleanup) == 0,
+	       "register mismatch cleanup observer");
+	if (on_exit)
+		exit(23);
+	check(freechat(chat, renderer), "release chat image storage");
+	die("test failed: mismatched chat release reported success");
+}
+
+static SDL_Surface *frame_storage_source;
+
+static void
+frame_storage_cleanup(void)
+{
+	SDL_DestroySurface(frame_storage_source);
+	frame_storage_source = NULL;
+	cleanup();
+	if (app.renderer.retained.bytes) {
+		fprintf(
+		    stderr,
+		    "test failed: frame allocation left %zu retained bytes\n",
+		    app.renderer.retained.bytes);
+		_Exit(90);
+	}
+	fputs("unit: failed frame allocation leaves zero retained bytes\n",
+	      stderr);
+}
+
+static void
+frame_storage_oom(App *run, int allocation)
+{
+	size_t index;
+
+	index = asset(&run->chat, "https://example.com/storage.png", 1);
+	run->chat.assets[index].target_width = 2;
+	frame_storage_source = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
+	check(frame_storage_source != NULL, "create uncharged frame source");
+	expect(atexit(frame_storage_cleanup) == 0,
+	       "register frame cleanup check");
+	asset_frame(&run->renderer, 2, &run->chat.assets[index],
+		    frame_storage_source, 100);
+	expect(run->renderer.retained.bytes == 16,
+	       "existing retained frame before allocation failure");
+	run->fail_next_resize = allocation;
+	asset_frame(&run->renderer, 2, &run->chat.assets[index],
+		    frame_storage_source, 100);
+	die("test failed: frame allocation did not fail");
+}
+
+static void
 blend_tests(App *run)
 {
 	Renderer *renderer = &run->renderer;
-	SDL_Surface *source, *actual, *expected;
+	SDL_Surface *source = NULL, *actual = NULL, *expected = NULL;
 	unsigned char *s, *d;
 	int x, y;
 	size_t before;
 
-	before = renderer->surface_bytes;
-	source = surface(renderer, 256, 256);
-	actual = surface(renderer, 256, 256);
-	expected = surface(renderer, 256, 256);
+	before = renderer->retained.bytes;
+	surface_create(renderer, &source, 256, 256);
+	surface_create(renderer, &actual, 256, 256);
+	surface_create(renderer, &expected, 256, 256);
 	/* All 65,536 source/destination alpha pairs, including hidden RGB. */
 	for (y = 0; y < 256; y++) {
 		for (x = 0; x < 256; x++) {
@@ -279,10 +552,10 @@ blend_tests(App *run)
 	reference_paste(expected, source, 0, 0);
 	paste(actual, source, 0, 0);
 	surfaces_equal(actual, expected);
-	surface_free(renderer, source);
-	surface_free(renderer, actual);
-	surface_free(renderer, expected);
-	expect(renderer->surface_bytes == before, "blend fixtures released");
+	surface_destroy(renderer, &source);
+	surface_destroy(renderer, &actual);
+	surface_destroy(renderer, &expected);
+	expect(renderer->retained.bytes == before, "blend fixtures released");
 }
 
 static void
@@ -293,16 +566,17 @@ sprite_tests(App *run)
 			     -0.75, -0.5, -0.25,  0,	 0.25,	0.5,
 			     0.75,  9,	  9.5,	  31.75, 32};
 	const int ys[] = {-8, -5, -1, 0, 3, 8};
-	SDL_Surface *source, *reference, *actual, *expected;
+	SDL_Surface *source = NULL, *reference = NULL, *actual = NULL,
+		    *expected = NULL;
 	Sprite *sprite;
 	unsigned char *p;
 	int variant, x, y, visible;
 	size_t i, j, before, allocated;
 
-	before = renderer->surface_bytes;
+	before = renderer->retained.bytes;
 	for (variant = 0; variant < 5; variant++) {
-		source = surface(renderer, 64, 6);
-		reference = surface(renderer, 64, 6);
+		surface_create(renderer, &source, 64, 6);
+		surface_create(renderer, &reference, 64, 6);
 		for (y = 0; y < source->h; y++) {
 			for (x = 0; x < source->w; x++) {
 				p = (unsigned char *)source->pixels +
@@ -327,26 +601,33 @@ sprite_tests(App *run)
 				   y * source->pitch,
 			       64 * 4);
 		}
-		allocated = renderer->surface_bytes;
+		allocated = renderer->retained.bytes;
 		if (variant == 4)
-			renderer->surface_bytes = MAX_MEMORY;
-		sprite = sprite_create(renderer, source);
+			renderer->retained.bytes = MAX_MEMORY;
+		sprite = resize(NULL, 1, sizeof *sprite);
+		memset(sprite, 0, sizeof *sprite);
+		sprite->pixels = source;
+		sprite_pack(renderer, sprite);
 		if (variant == 4)
-			renderer->surface_bytes = allocated;
+			renderer->retained.bytes = allocated;
 		if (variant == 0)
-			expect(!sprite->pixels && sprite->bytes &&
-				   renderer->surface_bytes < allocated,
+			expect(!sprite->pixels && sprite->bytes == 348 &&
+				   renderer->retained.bytes == before + 1884,
 			       "transparent pixels omitted and dense storage "
 			       "released");
 		else if (variant == 1)
-			expect(!sprite->pixels && !sprite->bytes,
-			       "empty sprite has no runs");
+			expect(!sprite->pixels && !sprite->bytes &&
+				   renderer->retained.bytes == before + 1536,
+			       "empty sprite releases all dense bytes and has "
+			       "no runs");
 		else
-			expect(sprite->pixels == source && !sprite->bytes,
+			expect(sprite->pixels == source && !sprite->bytes &&
+				   renderer->retained.bytes == before + 3072,
 			       "dense/checkerboard/budget fallback preserves "
 			       "source");
-		actual = surface(renderer, 32, 8);
-		expected = surface(renderer, 32, 8);
+		source = NULL;
+		surface_create(renderer, &actual, 32, 8);
+		surface_create(renderer, &expected, 32, 8);
 		for (i = 0; i < sizeof xs / sizeof *xs; i++) {
 			for (j = 0; j < sizeof ys / sizeof *ys; j++) {
 				for (y = 0; y < actual->h; y++) {
@@ -380,11 +661,12 @@ sprite_tests(App *run)
 				surfaces_equal(actual, expected);
 			}
 		}
-		surface_free(renderer, actual);
-		surface_free(renderer, expected);
-		surface_free(renderer, reference);
-		sprite_free(renderer, sprite);
-		expect(renderer->surface_bytes == before,
+		surface_destroy(renderer, &actual);
+		surface_destroy(renderer, &expected);
+		surface_destroy(renderer, &reference);
+		expect(sprite_free(renderer, &sprite) && !sprite,
+		       "sprite destruction clears its owner slot");
+		expect(renderer->retained.bytes == before,
 		       "packed and dense sprite ownership");
 	}
 }
@@ -405,19 +687,23 @@ subpixel_motion_tests(App *run)
 	     255, 64, 255, 0, 0,   64,	255, 0,	 0,   64},
 	    {255, 255, 255, 64, 255, 255, 255, 64, 0, 0,
 	     255, 64,  0,   0,	255, 64,  0,   0,  0, 0}};
-	SDL_Surface *image;
+	SDL_Surface *image = NULL;
 	Message *m;
 	Asset *a;
 	unsigned char *pixels;
 	size_t i, index, before;
 
-	before = renderer->surface_bytes;
-	renderer->canvas = surface(renderer, 4, 1);
-	image = surface(renderer, 1, 1);
+	before = renderer->retained.bytes;
+	surface_create(renderer, &renderer->canvas, 4, 1);
+	surface_create(renderer, &image, 1, 1);
 	memset(image->pixels, 255, 4);
 	m = message(scene, 0);
 	m->width = 1;
-	m->sprite = sprite_create(renderer, image);
+	m->sprite = resize(NULL, 1, sizeof *m->sprite);
+	memset(m->sprite, 0, sizeof *m->sprite);
+	m->sprite->pixels = image;
+	image = NULL;
+	sprite_pack(renderer, m->sprite);
 	plan->travel = SECOND;
 	plan->opacity = 100;
 	for (i = 0; i < sizeof times / sizeof *times; i++) {
@@ -446,8 +732,8 @@ subpixel_motion_tests(App *run)
 	       "global opacity is applied after subpixel interpolation");
 
 	/* Text and animated images must use the same fractional phase. */
-	surface_free(renderer, renderer->canvas);
-	renderer->canvas = surface(renderer, 5, 1);
+	surface_destroy(renderer, &renderer->canvas);
+	surface_create(renderer, &renderer->canvas, 5, 1);
 	glyphs->lane_height = 1;
 	index = asset(scene, "https://example.com/subpixel.gif", 1);
 	a = &scene->assets[index];
@@ -457,7 +743,8 @@ subpixel_motion_tests(App *run)
 	a->ends[0] = 450000;
 	a->ends[1] = 850000;
 	for (i = 0; i < 2; i++) {
-		a->frames[i] = surface(renderer, 1, 1);
+		a->frames[i] = NULL;
+		surface_create(renderer, &a->frames[i], 1, 1);
 		pixels = a->frames[i]->pixels;
 		pixels[i * 2] = 255;
 		pixels[3] = 255;
@@ -474,11 +761,10 @@ subpixel_motion_tests(App *run)
 		    "text and GIF share subpixel movement, time and opacity");
 	}
 	freechat(scene, renderer);
-	surface_free(renderer, renderer->canvas);
-	renderer->canvas = NULL;
+	surface_destroy(renderer, &renderer->canvas);
 	memset(options, 0, sizeof *options);
 	memset(plan, 0, sizeof *plan);
-	expect(renderer->surface_bytes == before,
+	expect(renderer->retained.bytes == before,
 	       "subpixel motion fixtures released");
 }
 
@@ -688,7 +974,7 @@ width_geometry_tests(App *run)
 	Glyphs *glyphs = &run->glyphs;
 	Renderer *renderer = &run->renderer;
 	RenderPlan *plan = &run->renderer.plan;
-	SDL_Surface *source;
+	SDL_Surface *source = NULL;
 	Message *m;
 	size_t index;
 	int decoded_width, decoded_height;
@@ -714,12 +1000,12 @@ width_geometry_tests(App *run)
 		   m->parts[1].x == 10 && m->parts[1].width == 8 &&
 		   m->width == 18 && m->time == 123456,
 	       "aspect two measures literal positions and preserves time");
-	source = surface(renderer, 2, 2);
+	surface_create(renderer, &source, 2, 2);
 	asset_frame(renderer, glyphs->emote_height, &scene->assets[index],
 		    source, 100);
 	decoded_width = scene->assets[index].frames[0]->w;
 	decoded_height = scene->assets[index].frames[0]->h;
-	surface_free(renderer, source);
+	surface_destroy(renderer, &source);
 	freechat(scene, renderer);
 	expect(decoded_width == 8 && decoded_height == 4,
 	       "square RGBA source normalizes to metadata width eight");
@@ -738,12 +1024,12 @@ width_geometry_tests(App *run)
 		   m->parts[1].x == 3 && m->parts[1].width == 1 &&
 		   m->width == 4 && m->time == 654321,
 	       "tiny positive aspect measures width one and preserves time");
-	source = surface(renderer, 2, 2);
+	surface_create(renderer, &source, 2, 2);
 	asset_frame(renderer, glyphs->emote_height, &scene->assets[index],
 		    source, 100);
 	decoded_width = scene->assets[index].frames[0]->w;
 	decoded_height = scene->assets[index].frames[0]->h;
-	surface_free(renderer, source);
+	surface_destroy(renderer, &source);
 	freechat(scene, renderer);
 	expect(decoded_width == 1 && decoded_height == 4,
 	       "tiny positive aspect decodes to width one");
@@ -823,7 +1109,7 @@ width_decode_tests(App *run)
 	SDL_Process **child = &run->child;
 	const double aspects[] = {2, 0.01};
 	const int widths[] = {8, 1};
-	SDL_Surface *source;
+	SDL_Surface *source = NULL;
 	SDL_IOStream *io;
 	Message *m;
 	Asset *a;
@@ -883,12 +1169,12 @@ width_decode_tests(App *run)
 			     plan->travel);
 		hashurl(scene->assets[index].url, hash);
 		path = format("%s/%s", work->directory, hash);
-		source = surface(renderer, 2, 2);
+		surface_create(renderer, &source, 2, 2);
 		memset(source->pixels, 255, (size_t)source->pitch * source->h);
 		io = SDL_IOFromFile(path, "wb");
 		expect(io != NULL && IMG_SavePNG_IO(source, io, true),
 		       "write owned square PNG width fixture");
-		surface_free(renderer, source);
+		surface_destroy(renderer, &source);
 		load_asset(renderer, glyphs->emote_height, work, cache, child,
 			   &scene->assets[index], work->directory);
 		a = &scene->assets[index];
@@ -913,17 +1199,17 @@ asset_frame_tests(App *run)
 	Glyphs *glyphs = &run->glyphs;
 	Renderer *renderer = &run->renderer;
 	Asset a = {0};
-	SDL_Surface *source, *rgba, *scaled;
+	SDL_Surface *source = NULL, *rgba, *scaled;
 	unsigned char *p;
 	int size, x, y;
 	size_t before, i;
 	int64_t t;
 
-	before = renderer->surface_bytes;
+	before = renderer->retained.bytes;
 	glyphs->emote_height = 4;
 	a.target_width = 4;
 	for (size = 2; size <= 4; size += 2) {
-		source = surface(renderer, size, size);
+		surface_create(renderer, &source, size, size);
 		for (y = 0; y < size; y++) {
 			p = (unsigned char *)source->pixels +
 			    y * source->pitch;
@@ -951,20 +1237,21 @@ asset_frame_tests(App *run)
 			       "adopted emote pixels equal copied pixels");
 		SDL_DestroySurface(rgba);
 		SDL_DestroySurface(scaled);
-		surface_free(renderer, source);
+		surface_destroy(renderer, &source);
 	}
 	for (i = 0; i < a.count; i++)
-		surface_free(renderer, a.frames[i]);
+		surface_destroy(renderer, &a.frames[i]);
 	free(a.frames);
 	free(a.ends);
-	expect(renderer->surface_bytes == before,
+	expect(renderer->retained.bytes == before,
 	       "adopted surfaces are accounted once");
 
 	a.count = MAX_FRAMES;
 	a.frames = resize(NULL, a.count, sizeof *a.frames);
 	a.ends = resize(NULL, a.count, sizeof *a.ends);
 	for (i = 0; i < a.count; i++) {
-		a.frames[i] = surface(renderer, 1, 1);
+		a.frames[i] = NULL;
+		surface_create(renderer, &a.frames[i], 1, 1);
 		a.ends[i] =
 		    (i ? a.ends[i - 1] : 0) + (int64_t)(i % 7 + 1) * 1000;
 	}
@@ -976,10 +1263,10 @@ asset_frame_tests(App *run)
 		       "and loops");
 	}
 	for (i = 0; i < a.count; i++)
-		surface_free(renderer, a.frames[i]);
+		surface_destroy(renderer, &a.frames[i]);
 	free(a.frames);
 	free(a.ends);
-	expect(renderer->surface_bytes == before,
+	expect(renderer->retained.bytes == before,
 	       "test GIF surfaces released");
 }
 
@@ -995,7 +1282,9 @@ cropped_frame_test(App *run, int64_t now)
 	full = renderer->canvas;
 	scene->messages[0].y = glyphs->lane_height;
 	drawframe(scene, glyphs, renderer, now, 0, 1, 0);
-	renderer->canvas = surface(renderer, full->w, glyphs->lane_height);
+	renderer->canvas = NULL;
+	surface_create(renderer, &renderer->canvas, full->w,
+		       glyphs->lane_height);
 	drawframe(scene, glyphs, renderer, now, 0, 1, glyphs->lane_height);
 	for (row = 0; row < renderer->canvas->h; row++)
 		expect(
@@ -1005,7 +1294,7 @@ cropped_frame_test(App *run, int64_t now)
 				(row + glyphs->lane_height) * full->pitch,
 			    (size_t)renderer->canvas->w * 4),
 		    "cropped RGBA band equals full text/GIF/alpha rendering");
-	surface_free(renderer, renderer->canvas);
+	surface_destroy(renderer, &renderer->canvas);
 	renderer->canvas = full;
 	scene->messages[0].y = 0;
 }
@@ -1051,7 +1340,45 @@ cache_cleanup_tests(App *run)
 }
 
 static void
-tests(App *run)
+storage_failure_tests(App *run, const char *program)
+{
+	const char *args[] = {program, "--frame-storage-oom", "1", NULL};
+	char *path;
+	unsigned char *diagnostic;
+	size_t length;
+	int status, closed, allocation;
+
+	path = format("%s/storage.stderr", run->work.directory);
+	for (allocation = 1; allocation <= 2; allocation++) {
+		args[2] = allocation == 1 ? "1" : "2";
+		run->work.log = SDL_IOFromFile(path, "wb");
+		check(run->work.log != NULL, "open storage failure log");
+		spawn(&run->child, args, 0, 0, run->work.log);
+		closed = SDL_CloseIO(run->work.log);
+		run->work.log = NULL;
+		check(closed, "close storage failure log");
+		check(SDL_WaitProcess(run->child, true, &status),
+		      "wait for storage failure");
+		SDL_DestroyProcess(run->child);
+		run->child = NULL;
+		diagnostic = readfile(path, MAX_JSON, &length);
+		expect(status == 1 &&
+			   strstr((const char *)diagnostic, "out of memory") &&
+			   strstr((const char *)diagnostic,
+				  "failed frame allocation leaves zero "
+				  "retained bytes"),
+		       "frame and delay array allocation failures release all "
+		       "retained frames");
+		free(diagnostic);
+	}
+	check(SDL_RemovePath(path), "remove storage failure log");
+	free(path);
+	puts("unit: both frame owner-array allocation failures clean retained "
+	     "storage OK");
+}
+
+static void
+tests(App *run, const char *program)
 {
 	Options *options = &run->options;
 	Chat *scene = &run->chat;
@@ -1061,7 +1388,7 @@ tests(App *run)
 	OutputWork *work = &run->work;
 	CacheStage *cache = &run->cache_stage;
 	SDL_Process **child = &run->child;
-	SDL_Surface *a, *b;
+	SDL_Surface *a = NULL, *b = NULL;
 	unsigned char *pixel;
 	char hash[65], *destination, *cached;
 	const char *tmp;
@@ -1083,6 +1410,7 @@ tests(App *run)
 	    "{\"url\":\"https://example.com/a.png\",\"width\":32,"
 	    "\"height\":16}]}}}]}}}}}]}}";
 
+	storage_tests(run);
 	blend_tests(run);
 	sprite_tests(run);
 	subpixel_motion_tests(run);
@@ -1108,8 +1436,8 @@ tests(App *run)
 			     "b00361a396177a9cb410ff61f20015ad"),
 	       "SHA-256 cache names");
 
-	a = surface(renderer, 1, 1);
-	b = surface(renderer, 1, 1);
+	surface_create(renderer, &a, 1, 1);
+	surface_create(renderer, &b, 1, 1);
 	pixel = b->pixels;
 	pixel[0] = 255;
 	pixel[3] = 128;
@@ -1125,8 +1453,8 @@ tests(App *run)
 	       "source-over colour");
 	paste(a, b, -2, -2);
 	paste(a, b, 2, 2);
-	surface_free(renderer, a);
-	surface_free(renderer, b);
+	surface_destroy(renderer, &a);
+	surface_destroy(renderer, &b);
 
 	tmp = SDL_getenv("TEMP");
 	if (!tmp)
@@ -1138,6 +1466,7 @@ tests(App *run)
 	free(destination);
 	work->stage = format("%s/chat.json", work->directory);
 	cache_cleanup_tests(run);
+	storage_failure_tests(run, program);
 	width_decode_tests(run);
 	writefile(work->stage, youtube, strlen(youtube));
 	readchat(scene, options->hls, options->origin, work->stage);
@@ -1189,7 +1518,7 @@ tests(App *run)
 				: glyphs->font_size / 2,
 			    plan->travel) == 0,
 	       "free lane");
-	renderer->canvas = surface(renderer, 200, 80);
+	surface_create(renderer, &renderer->canvas, 200, 80);
 	drawframe(scene, glyphs, renderer, 4850000, 0, 1, 0);
 	r = colour_x(run, 0);
 	w = colour_x(run, 2);
@@ -1200,8 +1529,8 @@ tests(App *run)
 	       "text and animated image share position and time");
 	cropped_frame_test(run, 4950000);
 	plan->shadow = 1;
-	sprite_free(renderer, m->sprite);
-	m->sprite = NULL;
+	expect(sprite_free(renderer, &m->sprite) && !m->sprite,
+	       "message sprite destruction clears its owner slot");
 	drawframe(scene, glyphs, renderer, 4950000, 0, 1, 0);
 	expect(colour_x(run, 1) == blue, "shadow does not move emote");
 	cropped_frame_test(run, 4850000);
@@ -1235,6 +1564,9 @@ tests(App *run)
 		       "crowding never postpones a comment");
 	freechat(scene, renderer);
 	endwork(work, cache);
+	surface_destroy(renderer, &renderer->canvas);
+	expect(renderer->retained.bytes == 0,
+	       "native retained image destruction reaches zero");
 	puts("unit: clock, JSON, alpha, GIF, cache, layout OK");
 }
 
@@ -1940,7 +2272,7 @@ cli_tests(App *run, const char *bullet, const char *tool)
 	unsigned char *data;
 	size_t n, i, entries, before_entries;
 	Video v;
-	SDL_Surface *png;
+	SDL_Surface *png = NULL;
 	SDL_IOStream *io;
 	const struct {
 		const char *key, *value, *error;
@@ -2240,11 +2572,11 @@ cli_tests(App *run, const char *bullet, const char *tool)
 	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/2/default/dark/2.0",
 		hash);
 	image = format("%s/%s", dir, hash);
-	png = surface(renderer, 2, 2);
+	surface_create(renderer, &png, 2, 2);
 	memset(png->pixels, 255, (size_t)png->pitch * png->h);
 	io = SDL_IOFromFile(image, "wb");
 	expect(io != NULL && IMG_SavePNG_IO(png, io, true), "PNG fixture");
-	surface_free(renderer, png);
+	surface_destroy(renderer, &png);
 	path = fixture(run, "mixed.json", mixed);
 	run_case(run, 1, bullet, "render", source, path, "--output", result,
 		 "--force", "--duration", "1", "--travel-time", "1", "--font",
@@ -2425,6 +2757,16 @@ main(int argc, char **argv)
 			freechat(&app.chat, &app.renderer);
 			return 0;
 		}
+		if (!strcmp(argv[1], "--storage")) {
+			storage_tests(run);
+			return 0;
+		}
+		if (argc == 5 && !strcmp(argv[1], "--release-mismatch"))
+			release_mismatch(run, !strcmp(argv[2], "packed"),
+					 !strcmp(argv[3], "invalid"),
+					 !strcmp(argv[4], "atexit"));
+		if (!strcmp(argv[1], "--frame-storage-oom"))
+			frame_storage_oom(run, argc == 3 ? atoi(argv[2]) : 1);
 		if (!strcmp(argv[1], "--replacement-oom"))
 			replacement_oom(run);
 		if (!strcmp(argv[1], "--held-cross-exit"))
@@ -2481,6 +2823,6 @@ main(int argc, char **argv)
 	}
 	cross_cleanup_retry();
 	replacement_tests(run);
-	tests(run);
+	tests(run, argv[0]);
 	return 0;
 }

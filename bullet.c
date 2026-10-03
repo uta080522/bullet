@@ -32,6 +32,9 @@
 #define MAX_JSON (64 * 1024 * 1024)
 #define MAX_ASSET (8 * 1024 * 1024)
 #define MAX_PIXELS (7680 * 4320)
+#define MAX_IMAGE_WIDTH 65536
+#define MAX_IMAGE_HEIGHT 16000
+#define MAX_EMOTE_DIMENSION 4096
 #define MAX_MEMORY ((size_t)512 * 1024 * 1024)
 #define MAX_MESSAGES 200000
 #define MAX_PARTS 1000000
@@ -127,9 +130,13 @@ typedef struct {
 } RenderPlan;
 
 typedef struct {
+	size_t bytes;
+} ImageStorage;
+
+typedef struct {
 	RenderPlan plan;
 	SDL_Surface *canvas;
-	size_t surface_bytes;
+	ImageStorage retained;
 #ifdef BULLET_TEST
 	int dense_reference;
 #endif
@@ -188,10 +195,8 @@ resize(void *p, size_t n, size_t size)
 	if (!size || n > MAX_MEMORY / size)
 		die("allocation limit exceeded");
 #ifdef BULLET_TEST
-	if (app.fail_next_resize) {
-		app.fail_next_resize = 0;
+	if (app.fail_next_resize && !--app.fail_next_resize)
 		die("out of memory");
-	}
 #endif
 	q = realloc(p, n * size);
 	if (!q)
@@ -362,35 +367,94 @@ commitfile(const char *from, const char *to, int replace)
 #endif
 }
 
-static void
-surface_free(Renderer *renderer, SDL_Surface *s)
+static int
+image_dimensions(int width, int height)
 {
-	if (s) {
-		renderer->surface_bytes -= (size_t)s->pitch * s->h;
-		SDL_DestroySurface(s);
+	return width >= 1 && height >= 1 && width <= MAX_IMAGE_WIDTH &&
+	       height <= MAX_IMAGE_HEIGHT &&
+	       (int64_t)width * height <= MAX_PIXELS;
+}
+
+static int
+image_charge(ImageStorage *storage, size_t bytes)
+{
+	if (storage->bytes > MAX_MEMORY || bytes > MAX_MEMORY - storage->bytes)
+		return 0;
+	storage->bytes += bytes;
+	return 1;
+}
+
+static int
+image_release(ImageStorage *storage, size_t bytes)
+{
+	if (storage->bytes > MAX_MEMORY || bytes > storage->bytes) {
+		fprintf(stderr,
+			"bullet: retained image storage release mismatch: "
+			"%zu bytes retained, %zu bytes released\n",
+			storage->bytes, bytes);
+		return 0;
 	}
+	storage->bytes -= bytes;
+	return 1;
+}
+
+static int
+surface_take_new(Renderer *renderer, SDL_Surface **owner, SDL_Surface *s)
+{
+	size_t bytes;
+
+	if (!s)
+		return 0;
+	if (*owner == s)
+		return 0;
+	if (*owner || !image_dimensions(s->w, s->h) ||
+	    s->format != SDL_PIXELFORMAT_RGBA32 || s->pitch < s->w * 4 ||
+	    (size_t)s->pitch > SIZE_MAX / (size_t)s->h) {
+		SDL_DestroySurface(s);
+		return 0;
+	}
+	bytes = (size_t)s->pitch * s->h;
+	if (!image_charge(&renderer->retained, bytes)) {
+		SDL_DestroySurface(s);
+		return 0;
+	}
+	*owner = s;
+	return 1;
 }
 
 static void
-surface_limit(const Renderer *renderer, int width, int height)
-{
-	if (width < 1 || height < 1 || width > 65536 || height > 16000 ||
-	    (int64_t)width * height > MAX_PIXELS)
-		die("image dimensions exceed limit: %dx%d", width, height);
-	if ((size_t)width * height * 4 > MAX_MEMORY - renderer->surface_bytes)
-		die("decoded image memory exceeds 512 MiB");
-}
-
-static SDL_Surface *
-surface(Renderer *renderer, int width, int height)
+surface_create(Renderer *renderer, SDL_Surface **owner, int width, int height)
 {
 	SDL_Surface *s;
+	size_t bytes;
 
-	surface_limit(renderer, width, height);
+	if (*owner)
+		die("retained surface owner is already occupied");
+	if (!image_dimensions(width, height))
+		die("image dimensions exceed limit: %dx%d", width, height);
+	bytes = (size_t)width * height * 4;
+	if (renderer->retained.bytes > MAX_MEMORY ||
+	    bytes > MAX_MEMORY - renderer->retained.bytes)
+		die("retained image storage exceeds 512 MiB");
 	s = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
 	check(s != NULL, "create RGBA surface");
-	renderer->surface_bytes += (size_t)s->pitch * s->h;
-	return s;
+	check(surface_take_new(renderer, owner, s),
+	      "adopt retained RGBA surface within 512 MiB");
+}
+
+static int
+surface_destroy(Renderer *renderer, SDL_Surface **owner)
+{
+	SDL_Surface *s = *owner;
+	int ok = 1;
+
+	*owner = NULL;
+	if (s) {
+		ok = image_release(&renderer->retained,
+				   (size_t)s->pitch * s->h);
+		SDL_DestroySurface(s);
+	}
+	return ok;
 }
 
 /* A NULL destination measures the packed size without allocating. */
@@ -429,68 +493,79 @@ pack_runs(const SDL_Surface *s, unsigned char *data, size_t limit)
 	return size;
 }
 
-/* Takes ownership. Keep dense pixels if packing cannot save memory or if
- * the temporary allocation would exceed the existing image budget. */
-static Sprite *
-sprite_create(Renderer *renderer, SDL_Surface *pixels)
+static void
+sprite_pack(Renderer *renderer, Sprite *s)
 {
-	Sprite *s;
 	size_t limit, bytes;
+	unsigned char *runs = NULL;
 
-	s = resize(NULL, 1, sizeof *s);
-	memset(s, 0, sizeof *s);
-	s->pixels = pixels;
+	if (!s->pixels)
+		return;
 #ifdef BULLET_TEST
 	if (renderer->dense_reference)
-		return s;
+		return;
 #endif
-	limit = (size_t)pixels->pitch * pixels->h - 1;
-	if (limit > MAX_MEMORY - renderer->surface_bytes)
-		limit = MAX_MEMORY - renderer->surface_bytes;
-	bytes = pack_runs(pixels, NULL, limit);
+	if (renderer->retained.bytes > MAX_MEMORY)
+		die("retained image storage exceeds 512 MiB");
+	limit = (size_t)s->pixels->pitch * s->pixels->h - 1;
+	if (limit > MAX_MEMORY - renderer->retained.bytes)
+		limit = MAX_MEMORY - renderer->retained.bytes;
+	bytes = pack_runs(s->pixels, NULL, limit);
 	if (bytes == NONE)
-		return s;
+		return;
 	if (bytes) {
-		s->runs = malloc(bytes);
-		if (!s->runs)
-			return s;
-		if (pack_runs(pixels, s->runs, bytes) != bytes)
+		runs = malloc(bytes);
+		if (!runs)
+			return;
+		if (pack_runs(s->pixels, runs, bytes) != bytes) {
+			free(runs);
 			die("sprite run sizes disagree");
+		}
 	}
+	if (!image_charge(&renderer->retained, bytes)) {
+		free(runs);
+		return;
+	}
+	s->runs = runs;
 	s->bytes = bytes;
-	renderer->surface_bytes += bytes;
-	surface_free(renderer, pixels);
-	s->pixels = NULL;
-	return s;
+	check(surface_destroy(renderer, &s->pixels),
+	      "release dense sprite storage");
 }
 
-static void
-sprite_free(Renderer *renderer, Sprite *s)
+static int
+sprite_free(Renderer *renderer, Sprite **owner)
 {
+	Sprite *s = *owner;
+	int ok = 1;
+
+	*owner = NULL;
 	if (s) {
-		surface_free(renderer, s->pixels);
-		renderer->surface_bytes -= s->bytes;
+		ok = surface_destroy(renderer, &s->pixels);
+		ok &= image_release(&renderer->retained, s->bytes);
 		free(s->runs);
 		free(s);
 	}
+	return ok;
 }
 
-static void
+static int
 freechat(Chat *chat, Renderer *renderer)
 {
 	size_t i, j;
+	int ok = 1;
 
 	for (i = 0; i < chat->nmessages; i++) {
 		for (j = 0; j < chat->messages[i].count; j++)
 			free(chat->messages[i].parts[j].text);
 		free(chat->messages[i].parts);
-		sprite_free(renderer, chat->messages[i].sprite);
+		ok &= sprite_free(renderer, &chat->messages[i].sprite);
 	}
 	for (i = 0; i < chat->nassets; i++) {
 		free(chat->assets[i].url);
 		free(chat->assets[i].embedded);
 		for (j = 0; j < chat->assets[i].count; j++)
-			surface_free(renderer, chat->assets[i].frames[j]);
+			ok &= surface_destroy(renderer,
+					      &chat->assets[i].frames[j]);
 		free(chat->assets[i].frames);
 		free(chat->assets[i].ends);
 	}
@@ -499,6 +574,7 @@ freechat(Chat *chat, Renderer *renderer)
 	chat->messages = NULL;
 	chat->assets = NULL;
 	chat->nmessages = chat->nassets = chat->nparts = 0;
+	return ok;
 }
 
 static int
@@ -563,8 +639,7 @@ cleanup(void)
 	free(app.inferred_chat);
 	free(app.inferred_output);
 	app.inferred_chat = app.inferred_output = NULL;
-	surface_free(&app.renderer, app.renderer.canvas);
-	app.renderer.canvas = NULL;
+	surface_destroy(&app.renderer, &app.renderer.canvas);
 	TTF_CloseFont(app.glyphs.font);
 	app.glyphs.font = NULL;
 	TTF_Quit();
@@ -1467,7 +1542,12 @@ asset_frame(Renderer *renderer, int emote_height, Asset *a,
 
 	if (a->count == MAX_FRAMES || delay_ms > 86400000)
 		die("emote frame count or duration exceeds limit");
-	surface_limit(renderer, a->target_width, emote_height);
+	if (!image_dimensions(source->w, source->h) ||
+	    !image_dimensions(a->target_width, emote_height))
+		die("emote dimensions exceed limit");
+	a->frames = resize(a->frames, a->count + 1, sizeof *a->frames);
+	a->frames[a->count] = NULL;
+	a->ends = resize(a->ends, a->count + 1, sizeof *a->ends);
 	rgba = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
 	check(rgba != NULL, "convert emote pixels");
 	/* Own the resized pixels directly; no second surface and row copy. */
@@ -1475,14 +1555,12 @@ asset_frame(Renderer *renderer, int emote_height, Asset *a,
 	if (rgba->w != a->target_width || rgba->h != emote_height) {
 		out = SDL_ScaleSurface(rgba, a->target_width, emote_height,
 				       SDL_SCALEMODE_LINEAR);
-		check(out != NULL, "resize emote");
 		SDL_DestroySurface(rgba);
+		check(out != NULL, "resize emote");
 	}
-	renderer->surface_bytes += (size_t)out->pitch * out->h;
-	a->frames = resize(a->frames, a->count + 1, sizeof *a->frames);
-	a->ends = resize(a->ends, a->count + 1, sizeof *a->ends);
+	check(surface_take_new(renderer, &a->frames[a->count], out),
+	      "adopt retained emote within 512 MiB");
 	end = a->count ? a->ends[a->count - 1] : 0;
-	a->frames[a->count] = out;
 	a->ends[a->count++] =
 	    end + (int64_t)(delay_ms < 20 ? 20 : delay_ms) * 1000;
 }
@@ -1527,7 +1605,8 @@ load_asset(Renderer *renderer, int emote_height, OutputWork *work,
 	stream = video_stream(metadata);
 	width = number(field(stream, "width"));
 	height = number(field(stream, "height"));
-	if (width < 1 || height < 1 || width > 4096 || height > 4096)
+	if (width < 1 || height < 1 || width > MAX_EMOTE_DIMENSION ||
+	    height > MAX_EMOTE_DIMENSION)
 		die("emote exceeds 4096x4096: %s", a->url);
 	cJSON_Delete(metadata);
 	io = SDL_IOFromConstMem(bytes, length);
@@ -1879,6 +1958,10 @@ text_surface(const Glyphs *glyphs, const char *text, SDL_Color color)
 
 	s = TTF_RenderText_Blended(glyphs->font, text, 0, color);
 	check(s != NULL, "rasterize text");
+	if (!image_dimensions(s->w, s->h)) {
+		SDL_DestroySurface(s);
+		die("text dimensions exceed limit");
+	}
 	rgba = SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32);
 	SDL_DestroySurface(s);
 	check(rgba != NULL, "convert text pixels");
@@ -1895,7 +1978,11 @@ bake(const Chat *chat, const Glyphs *glyphs, Renderer *renderer, int shadow,
 	size_t j;
 	int y, dx, dy;
 
-	pixels = surface(renderer, m->width + 2, glyphs->lane_height);
+	m->sprite = resize(NULL, 1, sizeof *m->sprite);
+	memset(m->sprite, 0, sizeof *m->sprite);
+	surface_create(renderer, &m->sprite->pixels, m->width + 2,
+		       glyphs->lane_height);
+	pixels = m->sprite->pixels;
 	for (j = 0; j < m->count; j++) {
 		p = &m->parts[j];
 		if (p->asset != NONE) {
@@ -1928,7 +2015,7 @@ bake(const Chat *chat, const Glyphs *glyphs, Renderer *renderer, int shadow,
 		SDL_DestroySurface(fill);
 		SDL_DestroySurface(edge);
 	}
-	m->sprite = sprite_create(renderer, pixels);
+	sprite_pack(renderer, m->sprite);
 }
 
 static void
@@ -2191,7 +2278,7 @@ render(const Options *options, Chat *chat, Glyphs *glyphs, Renderer *renderer,
 		}
 	}
 	free(directory);
-	renderer->canvas = surface(renderer, width, overlay.height);
+	surface_create(renderer, &renderer->canvas, width, overlay.height);
 	snprintf(fps, sizeof fps, "%d/%d", plan->fps_num, plan->fps_den);
 	snprintf(dimensions, sizeof dimensions, "%dx%d", width,
 		 overlay.height);
@@ -2235,8 +2322,9 @@ render(const Options *options, Chat *chat, Glyphs *glyphs, Renderer *renderer,
 			last++;
 		while (first < last &&
 		       chat->messages[first].time + plan->travel <= now) {
-			sprite_free(renderer, chat->messages[first].sprite);
-			chat->messages[first++].sprite = NULL;
+			check(sprite_free(renderer,
+					  &chat->messages[first++].sprite),
+			      "release expired sprite storage");
 		}
 #ifdef BULLET_TEST
 		if (renderer->dense_reference)
@@ -2272,7 +2360,7 @@ render(const Options *options, Chat *chat, Glyphs *glyphs, Renderer *renderer,
 			    (double)(now - plan->start) / SECOND,
 			    (double)plan->duration / SECOND, elapsed,
 			    (double)(now - plan->start) / SECOND / elapsed,
-			    (double)renderer->surface_bytes / (1024 * 1024),
+			    (double)renderer->retained.bytes / (1024 * 1024),
 			    last - first);
 			reported = ticks;
 		}
@@ -2364,7 +2452,8 @@ download(const Options *options, Chat *scene, Renderer *renderer,
 			waitchild(child);
 			readchat(scene, options->hls, options->origin,
 				 work->stage);
-			freechat(scene, renderer);
+			check(freechat(scene, renderer),
+			      "release chat image storage");
 			if (!commitfile(work->stage, chat, 0))
 				die("cannot commit chat without overwriting "
 				    "%s",
@@ -2372,7 +2461,8 @@ download(const Options *options, Chat *scene, Renderer *renderer,
 			endwork(work, cache);
 		} else {
 			readchat(scene, options->hls, options->origin, chat);
-			freechat(scene, renderer);
+			check(freechat(scene, renderer),
+			      "release chat image storage");
 		}
 		free(chat);
 		for (i = 0; i < sizeof extensions / sizeof *extensions; i++) {
@@ -2441,7 +2531,7 @@ download(const Options *options, Chat *scene, Renderer *renderer,
 		free(p);
 	}
 	readchat(scene, options->hls, options->origin, chat);
-	freechat(scene, renderer);
+	check(freechat(scene, renderer), "release chat image storage");
 	fprintf(stderr, "bullet: downloaded %s\n", video);
 	free(chat);
 	free(video);
