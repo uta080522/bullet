@@ -1,6 +1,15 @@
 /* White-box tests, an exact-pixel encoder, and offline download tools. */
 #define BULLET_TEST
+#include <SDL3/SDL.h>
+
+static SDL_IOStream *cache_payload_open(const char *path, const char *mode);
+static SDL_EnumerationResult SDLCALL remove_entry(void *unused,
+						  const char *dir,
+						  const char *name);
+
+#define SDL_IOFromFile cache_payload_open
 #include "bullet.c"
+#undef SDL_IOFromFile
 
 static const char gif[] =
     "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh"
@@ -1354,6 +1363,277 @@ cache_cleanup_tests(App *run)
 #endif
 }
 
+typedef struct {
+	const char *name;
+	int write_error, not_ready, close_error, status;
+	const char *diagnostic;
+} CacheWriteCase;
+
+static const CacheWriteCase cache_write_cases[] = {
+    {"control", 0, 0, 0, 0,
+     "unit: cache payload forwarded 111 of 111 bytes\n"},
+    {"not-ready", 0, 1, 0, 0, "unit: cache payload NOT_READY once\n"},
+    {"write-error", 1, 0, 0, 1,
+     "bullet: write failed: injected cache payload write failure\n"},
+    {"close-error", 0, 0, 1, 1,
+     "bullet: close output: injected cache payload close failure\n"},
+    {"write-close-error", 1, 0, 1, 1,
+     "bullet: write failed: injected cache payload write failure\n"}};
+
+typedef struct {
+	const CacheWriteCase *scenario;
+	SDL_IOStream *real, *wrapper;
+	char *directory, *payload, *work_directory, *asset_temp;
+	char *source, *output, *sentinel, *committed, *cache;
+	unsigned char *bytes;
+	size_t length;
+	int opened, writes, production_closes, observer_closes, native_closes;
+	int injected_write, injected_ready, injected_close, partial, decoded,
+	    returned;
+	int observing;
+} CacheWriteProbe;
+
+static CacheWriteProbe cache_write_probe;
+
+static size_t SDLCALL
+cache_payload_write(void *userdata, const void *data, size_t n,
+		    SDL_IOStatus *status)
+{
+	CacheWriteProbe *p = userdata;
+	size_t written, requested = p->scenario->write_error ? 1 : n;
+
+	p->writes++;
+	if (p->scenario->write_error && p->writes == 2) {
+		p->injected_write++;
+		*status = SDL_IO_STATUS_ERROR;
+		SDL_SetError("injected cache payload write failure");
+		fprintf(stderr,
+			"unit: cache payload ERROR after one real byte\n");
+		return 0;
+	}
+	if (p->scenario->not_ready && p->writes == 1) {
+		p->injected_ready++;
+		*status = SDL_IO_STATUS_NOT_READY;
+		fprintf(stderr, "unit: cache payload NOT_READY once\n");
+		return 0;
+	}
+	written = SDL_WriteIO(p->real, data, requested);
+	*status = SDL_GetIOStatus(p->real);
+	if (p->scenario->write_error && p->writes == 1)
+		p->partial = written == 1 && *status == SDL_IO_STATUS_READY;
+	fprintf(stderr, "unit: cache payload forwarded %zu of %zu bytes\n",
+		written, requested);
+	return written;
+}
+
+static bool SDLCALL
+cache_payload_close(void *userdata)
+{
+	CacheWriteProbe *p = userdata;
+	SDL_IOStream *real = p->real;
+	bool ok;
+
+	p->real = p->wrapper = NULL;
+	if (p->observing)
+		p->observer_closes++;
+	else
+		p->production_closes++;
+	ok = SDL_CloseIO(real);
+	p->native_closes += ok;
+	fprintf(stderr, "unit: cache payload %s close native=%d\n",
+		p->observing ? "observer recovery" : "production", ok);
+	if (p->scenario->close_error && !p->observing) {
+		p->injected_close++;
+		SDL_SetError("injected cache payload close failure");
+		fprintf(stderr, "unit: cache payload injected close ERROR\n");
+		return false;
+	}
+	return ok;
+}
+
+static SDL_IOStream *
+cache_payload_open(const char *path, const char *mode)
+{
+	CacheWriteProbe *p = &cache_write_probe;
+	SDL_IOStream *io = SDL_IOFromFile(path, mode);
+	SDL_IOStreamInterface iface;
+	Asset *a;
+
+	if (!p->scenario || !app.cache_stage.payload ||
+	    strcmp(path, app.cache_stage.payload) || strcmp(mode, "wb"))
+		return io;
+	check(io != NULL, "open actual cache payload");
+	expect(!p->real && !p->wrapper && !p->opened,
+	       "one intercepted native cache payload");
+	p->real = io;
+	p->opened++;
+	p->directory = copystr(app.cache_stage.directory);
+	p->payload = copystr(path);
+	p->work_directory = copystr(app.work.directory);
+	p->asset_temp = copystr(app.work.asset_temp);
+	a = &app.chat.assets[0];
+	p->decoded = a->count == 2 && a->ends[0] == 100000 &&
+		     a->ends[1] == 300000 && a->frames[0]->w == 2 &&
+		     a->frames[0]->h == 2 && a->frames[1]->w == 2 &&
+		     a->frames[1]->h == 2 && exists(p->asset_temp);
+	expect(p->decoded,
+	       "real output verification and two decoded GIF frames");
+#ifdef _WIN32
+	expect(SDL_GetPointerProperty(SDL_GetIOProperties(io),
+				      SDL_PROP_IOSTREAM_WINDOWS_HANDLE_POINTER,
+				      NULL) != NULL,
+	       "wrapper owns actual Windows payload handle");
+#endif
+	fprintf(stderr, "unit: cache payload opened, decoded 2 frames, ends "
+			"100000 300000\n");
+	SDL_INIT_INTERFACE(&iface);
+	iface.write = cache_payload_write;
+	iface.close = cache_payload_close;
+	p->wrapper = SDL_OpenIO(&iface, p);
+	check(p->wrapper != NULL, "wrap owned native cache payload");
+	return p->wrapper;
+}
+
+static int
+cache_bytes_equal(const char *path, const void *expected, size_t length)
+{
+	unsigned char buffer[111];
+	SDL_IOStream *io = path ? SDL_IOFromFile(path, "rb") : NULL;
+	int ok;
+
+	if (!io)
+		return 0;
+	ok = expected && length <= sizeof buffer &&
+	     SDL_GetIOSize(io) == (Sint64)length &&
+	     SDL_ReadIO(io, buffer, length) == length &&
+	     !memcmp(buffer, expected, length);
+	return SDL_CloseIO(io) && ok;
+}
+
+static void
+cache_write_observe(void)
+{
+	CacheWriteProbe *p = &cache_write_probe;
+	int payload = p->payload && exists(p->payload);
+	int directory = p->directory && exists(p->directory);
+	int asset_temp = p->asset_temp && exists(p->asset_temp);
+	int work_directory = p->work_directory && exists(p->work_directory);
+	int preserved, boundary, recovered = 1;
+
+	if (!p->scenario) {
+		fprintf(stderr,
+			"unit: cache write observer has no scenario\n");
+		fflush(stderr);
+		_Exit(90);
+	}
+	preserved = cache_bytes_equal(p->source, p->bytes, p->length) &&
+		    cache_bytes_equal(p->output, "existing-output", 15) &&
+		    cache_bytes_equal(p->sentinel, "existing-cache", 14);
+	boundary = p->opened == 1 && p->decoded && p->production_closes == 1 &&
+		   p->native_closes == 1 && !p->real && !p->wrapper &&
+		   !payload && !directory && !asset_temp && !work_directory &&
+		   !app.cache_stage.directory && !app.cache_stage.payload &&
+		   !app.work.directory && !app.work.asset_temp &&
+		   !app.chat.assets && !app.child &&
+		   app.renderer.retained.bytes == 0 && preserved &&
+		   p->partial == p->scenario->write_error &&
+		   p->injected_write == p->scenario->write_error &&
+		   p->injected_ready == p->scenario->not_ready &&
+		   p->injected_close == p->scenario->close_error &&
+		   p->returned == (p->scenario->status == 0);
+	if (!p->scenario->status)
+		boundary &= cache_bytes_equal(p->committed, p->bytes, 111);
+	else
+		boundary &= !exists(p->committed);
+	fprintf(stderr,
+		"unit: cache write boundary %s opened=%d production_closes=%d "
+		"native_closes=%d payload=%d cache_stage=%d output_asset=%d "
+		"output_stage=%d preserved=%d\n",
+		p->scenario->name, p->opened, p->production_closes,
+		p->native_closes, payload, directory, asset_temp,
+		work_directory, preserved);
+	p->observing = 1;
+	if (p->wrapper)
+		recovered &= SDL_CloseIO(p->wrapper);
+	else if (p->real) {
+		recovered &= SDL_CloseIO(p->real);
+		p->real = NULL;
+	}
+	if (p->payload && exists(p->payload))
+		recovered &= SDL_RemovePath(p->payload);
+	if (p->directory && exists(p->directory))
+		recovered &= SDL_RemovePath(p->directory);
+	if (p->asset_temp && exists(p->asset_temp))
+		recovered &= SDL_RemovePath(p->asset_temp);
+	if (p->work_directory && exists(p->work_directory))
+		recovered &= SDL_RemovePath(p->work_directory);
+	fprintf(stderr,
+		"unit: cache write observer recovery closes=%d complete=%d\n",
+		p->observer_closes, recovered);
+	free(p->directory);
+	free(p->payload);
+	free(p->work_directory);
+	free(p->asset_temp);
+	free(p->source);
+	free(p->output);
+	free(p->sentinel);
+	free(p->committed);
+	free(p->cache);
+	free(p->bytes);
+	p->directory = p->payload = p->work_directory = p->asset_temp = NULL;
+	p->source = p->output = p->sentinel = p->committed = p->cache = NULL;
+	p->bytes = NULL;
+	p->scenario = NULL;
+	if (!boundary || !recovered) {
+		fprintf(stderr, "unit: cache write REGRESSION RED, production "
+				"close or cleanup boundary failed\n");
+		fflush(stderr);
+		_Exit(90);
+	}
+	fprintf(stderr, "unit: cache write production closed once, all stages "
+			"gone, original bytes preserved\n");
+}
+
+static void
+cache_write_child(App *run, const char *root, const char *mode)
+{
+	CacheWriteProbe *p = &cache_write_probe;
+	char hash[65];
+	size_t i;
+	Asset *a;
+
+	for (i = 0; i < sizeof cache_write_cases / sizeof *cache_write_cases;
+	     i++)
+		if (!strcmp(mode, cache_write_cases[i].name))
+			p->scenario = &cache_write_cases[i];
+	expect(p->scenario != NULL, "known cache payload fault mode");
+	p->source = format("%s/source.gif", root);
+	p->output = format("%s/existing-output.mp4", root);
+	p->cache = format("%s/cache", root);
+	p->sentinel = format("%s/existing", p->cache);
+	hashurl("https://example.invalid/cache-write.gif", hash);
+	p->committed = format("%s/%s", p->cache, hash);
+	p->bytes = unbase64(gif, &p->length);
+	expect(p->length == 111, "literal original GIF is 111 bytes");
+	expect(!exists(p->source) && !exists(p->output) && !exists(p->cache),
+	       "cache write subprocess receives a fresh exclusive fixture");
+	check(SDL_CreateDirectory(p->cache),
+	      "create owned cache write fixture");
+	writefile(p->source, p->bytes, p->length);
+	writefile(p->output, "existing-output", 15);
+	writefile(p->sentinel, "existing-cache", 14);
+	beginwork(&run->work, p->output);
+	i = asset(&run->chat, "https://example.invalid/cache-write.gif", 1);
+	a = &run->chat.assets[i];
+	a->embedded = copystr(gif);
+	a->target_width = 2;
+	fprintf(stderr, "unit: cache write mode %s, offline literal GIF\n",
+		mode);
+	load_asset(&run->renderer, 2, &run->work, &run->cache_stage,
+		   &run->child, a, p->cache);
+	p->returned = 1;
+}
+
 static char *
 fault_case(App *run, const char *const *args, int expected, const char *error,
 	   const char *marker)
@@ -1398,6 +1678,59 @@ fault_case(App *run, const char *const *args, int expected, const char *error,
 	free(diagnostic);
 	free(path);
 	return output;
+}
+
+static void
+cache_write_tests(App *run)
+{
+	const char *args[] = {unit_program, "--cache-write-fault", NULL, NULL,
+			      NULL};
+	char *root, *output, *log, *text;
+	size_t i, length, from, to;
+
+	unit_work(run);
+	for (i = 0; i < sizeof cache_write_cases / sizeof *cache_write_cases;
+	     i++) {
+		const CacheWriteCase *scenario = &cache_write_cases[i];
+
+		root = private_directory(run->work.directory);
+		args[2] = root;
+		args[3] = scenario->name;
+		printf("unit: cache write scenario %s\n", scenario->name);
+		output = fault_case(
+		    run, args, scenario->status, scenario->diagnostic,
+		    "unit: cache write production closed once, all stages "
+		    "gone, original bytes preserved\n");
+		expect(!*output, "cache payload fault has no stdout");
+		SDL_free(output);
+		log = format("%s/fault.stderr", run->work.directory);
+		text = (char *)readfile(log, MAX_JSON, &length);
+		for (from = to = 0; from < length; from++)
+			if (text[from] != '\r' || text[from + 1] != '\n')
+				text[to++] = text[from];
+		text[to] = 0;
+		expect(
+		    !strstr(text, "REGRESSION RED") &&
+			!strstr(text, "cannot remove private cache staging") &&
+			strstr(text, "unit: cache write observer recovery "
+				     "closes=0 complete=1\n"),
+		    "production cleanup completes without observer closure");
+		if (scenario->write_error && scenario->close_error)
+			expect(
+			    strstr(
+				text,
+				"bullet: cannot close private cache payload: "
+				"injected cache payload close failure\n") !=
+				NULL,
+			    "teardown close failure is reported nonfatally");
+		free(text);
+		free(log);
+		check(SDL_EnumerateDirectory(root, remove_entry, NULL),
+		      "remove checked exclusively owned cache write fixture");
+		check(SDL_RemovePath(root),
+		      "remove empty cache write fixture");
+		free(root);
+	}
 }
 
 static void
@@ -2904,6 +3237,15 @@ fixture_empty(const App *run)
 		   !run->chat_context && !cross_fixture &&
 		   !frame_storage_source,
 	       "fixture process, inferred paths and test owners empty");
+	expect(
+	    !cache_write_probe.real && !cache_write_probe.wrapper &&
+		!cache_write_probe.directory && !cache_write_probe.payload &&
+		!cache_write_probe.work_directory &&
+		!cache_write_probe.asset_temp && !cache_write_probe.source &&
+		!cache_write_probe.output && !cache_write_probe.sentinel &&
+		!cache_write_probe.committed && !cache_write_probe.cache &&
+		!cache_write_probe.bytes && !cache_write_probe.scenario,
+	    "fixture cache write observer and native stream owners empty");
 	expect(run->renderer.retained.bytes == 0,
 	       "fixture retained image storage reaches zero without reset");
 }
@@ -3086,7 +3428,8 @@ static const UnitCase unit_cases[] = {
     {"replacement-oom", replacement_failure_tests},
     {"frame-storage-oom", storage_failure_tests},
     {"release-mismatch", release_failure_tests},
-    {"held-cross-exit", held_exit_tests}};
+    {"held-cross-exit", held_exit_tests},
+    {"cache-write-teardown", cache_write_tests}};
 
 static void
 unit_run(App *run, const UnitCase *test, unsigned int repetition)
@@ -3135,12 +3478,19 @@ main(int argc, char **argv)
 	App *run = &app;
 	int mode;
 
+	if (argc == 4 && !strcmp(argv[1], "--cache-write-fault"))
+		expect(atexit(cache_write_observe) == 0,
+		       "register observer before production cleanup");
 	atexit(cleanup);
 	check(SDL_Init(0), "initialize SDL");
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
 		die("initialize HTTP library");
 	unit_program = argv[0];
 	if (argc > 1) {
+		if (argc == 4 && !strcmp(argv[1], "--cache-write-fault")) {
+			cache_write_child(run, argv[2], argv[3]);
+			return 0;
+		}
 		if (argc == 3 && !strcmp(argv[1], "--unit-case")) {
 			unit_named(run, argv[2]);
 			return 0;
