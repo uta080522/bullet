@@ -77,6 +77,25 @@ fake_tool(int argc, char **argv)
 		die("test downloader failed");
 }
 
+static const char *unit_program;
+
+static void
+unit_work(App *run)
+{
+	const char *tmp;
+	char *destination;
+
+	expect(!run->work.directory, "fixture work owner starts empty");
+	tmp = SDL_getenv("TEMP");
+	if (!tmp)
+		tmp = SDL_getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/tmp";
+	destination = format("%s/bullet-unit.mp4", tmp);
+	beginwork(&run->work, destination);
+	free(destination);
+}
+
 static void
 replacement_tests(App *run)
 {
@@ -92,7 +111,6 @@ replacement_tests(App *run)
 	expect(run->chat.nassets == 1 && run->chat.assets[0].aspect == 2 &&
 		   !strcmp(run->chat.assets[0].embedded, "second"),
 	       "repeated embedded URL replaces data but retains first aspect");
-	freechat(&run->chat, &run->renderer);
 }
 
 static void
@@ -258,7 +276,8 @@ storage_tests(App *run)
 	temporary = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
 	check(temporary != NULL, "create uncharged temporary fixture");
 	memset(temporary->pixels, 255, 16);
-	renderer->retained.bytes = MAX_MEMORY;
+	expect(image_charge(&renderer->retained, MAX_MEMORY),
+	       "reserve full storage for capacity rejection");
 	expect(image_dimensions(temporary->w, temporary->h),
 	       "temporary dimensions are valid at full retained capacity");
 	converted = SDL_ConvertSurface(temporary, SDL_PIXELFORMAT_RGBA32);
@@ -278,7 +297,8 @@ storage_tests(App *run)
 	expect(!image_charge(&renderer->retained, SIZE_MAX) &&
 		   renderer->retained.bytes == MAX_MEMORY,
 	       "oversized charge cannot wrap full storage");
-	renderer->retained.bytes = 0;
+	expect(image_release(&renderer->retained, MAX_MEMORY),
+	       "release exact synthetic capacity reservation");
 	SDL_DestroySurface(converted);
 
 	rejected = SDL_CreateSurface(65537, 1, SDL_PIXELFORMAT_RGBA32);
@@ -294,14 +314,16 @@ storage_tests(App *run)
 	expect(padded->pitch == 16 && padded->w == 3 && padded->h == 2,
 	       "padded fixture has twelve visible bytes in each sixteen-byte "
 	       "row");
-	renderer->retained.bytes = MAX_MEMORY - 24;
+	expect(image_charge(&renderer->retained, MAX_MEMORY - 24),
+	       "reserve all but twenty-four bytes for padded rejection");
 	padded->refcount++;
 	expect(!surface_take_new(renderer, &renderer->canvas, padded) &&
 		   !renderer->canvas && padded->refcount == 1 &&
 		   renderer->retained.bytes == MAX_MEMORY - 24,
 	       "twenty-four spare bytes cannot fit thirty-two actual padded "
 	       "bytes");
-	renderer->retained.bytes = 0;
+	expect(image_release(&renderer->retained, MAX_MEMORY - 24),
+	       "release exact padded capacity reservation");
 	expect(!image_charge(&renderer->retained, SIZE_MAX) &&
 		   renderer->retained.bytes == 0,
 	       "oversized charge cannot wrap empty storage");
@@ -386,13 +408,15 @@ storage_tests(App *run)
 	memset(m->sprite, 0, sizeof *m->sprite);
 	surface_create(renderer, &m->sprite->pixels, 8, 2);
 	((unsigned char *)m->sprite->pixels->pixels)[3] = 255;
-	renderer->retained.bytes = MAX_MEMORY - 15;
+	expect(image_charge(&renderer->retained, MAX_MEMORY - 15 - 64),
+	       "reserve all but fifteen bytes beside dense sprite");
 	sprite_pack(renderer, m->sprite);
 	expect(m->sprite->pixels && !m->sprite->runs && !m->sprite->bytes &&
 		   renderer->retained.bytes == MAX_MEMORY - 15,
 	       "fifteen spare bytes cannot fit a sixteen-byte run and keep "
 	       "dense pixels");
-	renderer->retained.bytes = 64;
+	expect(image_release(&renderer->retained, MAX_MEMORY - 15 - 64),
+	       "release reservation without erasing dense sprite charge");
 	sprite_pack(renderer, m->sprite);
 	expect(!m->sprite->pixels && m->sprite->bytes == 16 &&
 		   renderer->retained.bytes == 16,
@@ -603,13 +627,21 @@ sprite_tests(App *run)
 		}
 		allocated = renderer->retained.bytes;
 		if (variant == 4)
-			renderer->retained.bytes = MAX_MEMORY;
+			expect(image_charge(&renderer->retained,
+					    MAX_MEMORY - allocated),
+			       "reserve remaining packed fallback capacity");
 		sprite = resize(NULL, 1, sizeof *sprite);
 		memset(sprite, 0, sizeof *sprite);
 		sprite->pixels = source;
 		sprite_pack(renderer, sprite);
-		if (variant == 4)
-			renderer->retained.bytes = allocated;
+		if (variant == 4) {
+			expect(renderer->retained.bytes == MAX_MEMORY,
+			       "failed packing preserves full ledger");
+			expect(image_release(&renderer->retained,
+					     MAX_MEMORY - allocated),
+			       "release fallback reservation without erasing "
+			       "owners");
+		}
 		if (variant == 0)
 			expect(!sprite->pixels && sprite->bytes == 348 &&
 				   renderer->retained.bytes == before + 1884,
@@ -674,7 +706,6 @@ sprite_tests(App *run)
 static void
 subpixel_motion_tests(App *run)
 {
-	Options *options = &run->options;
 	Chat *scene = &run->chat;
 	Glyphs *glyphs = &run->glyphs;
 	Renderer *renderer = &run->renderer;
@@ -762,8 +793,6 @@ subpixel_motion_tests(App *run)
 	}
 	freechat(scene, renderer);
 	surface_destroy(renderer, &renderer->canvas);
-	memset(options, 0, sizeof *options);
-	memset(plan, 0, sizeof *plan);
 	expect(renderer->retained.bytes == before,
 	       "subpixel motion fixtures released");
 }
@@ -771,10 +800,8 @@ subpixel_motion_tests(App *run)
 static void
 frame_bounds_tests(App *run)
 {
-	Options *options = &run->options;
 	Chat *scene = &run->chat;
 	Glyphs *glyphs = &run->glyphs;
-	Renderer *renderer = &run->renderer;
 	RenderPlan *plan = &run->renderer.plan;
 	const int rates[][2] = {
 	    {25, 1}, {30000, 1001}, {113394000, 3780913}, {1, 10}, {240, 1}};
@@ -830,17 +857,15 @@ frame_bounds_tests(App *run)
 	expect(o.y == 0 && o.height == 1 && o.first == 0 && o.end == 1 &&
 		   o.visible == 0,
 	       "empty clip retains one transparent sample");
-	freechat(scene, renderer);
-	memset(options, 0, sizeof *options);
-	memset(plan, 0, sizeof *plan);
 }
 
 static void
-lane_tests(void)
+lane_tests(App *run)
 {
 	Message measured[6] = {{0}};
 	size_t fallbacks;
 
+	(void)run;
 	measured[0].width = 20;
 	measured[1].width = 60;
 	measured[2].width = 10;
@@ -871,12 +896,13 @@ lane_tests(void)
 }
 
 static void
-plan_tests(void)
+plan_tests(App *run)
 {
 	Options input = {0}, saved;
 	Video video = {160, 90, 30000, 1001, 2000000};
 	RenderPlan plan;
 
+	(void)run;
 	input.start = 501000;
 	input.duration = -1;
 	input.travel = 300000;
@@ -924,10 +950,8 @@ plan_tests(void)
 static void
 replan_tests(App *run)
 {
-	Options *options = &run->options;
 	Chat *scene = &run->chat;
 	Glyphs *glyphs = &run->glyphs;
-	Renderer *renderer = &run->renderer;
 	RenderPlan *plan = &run->renderer.plan;
 	Message *m;
 	Overlay o;
@@ -960,16 +984,12 @@ replan_tests(App *run)
 	    o.visible == 0 && o.height == 1 && o.first == 0 && o.end == 1 &&
 		scene->assets[0].needed == 0 && scene->assets[1].needed == 0,
 	    "empty replan clears every image and keeps one transparent frame");
-	freechat(scene, renderer);
-	memset(options, 0, sizeof *options);
-	memset(plan, 0, sizeof *plan);
 	puts("unit: independent visible-image replanning OK");
 }
 
 static void
 width_geometry_tests(App *run)
 {
-	Options *options = &run->options;
 	Chat *scene = &run->chat;
 	Glyphs *glyphs = &run->glyphs;
 	Renderer *renderer = &run->renderer;
@@ -1033,8 +1053,6 @@ width_geometry_tests(App *run)
 	freechat(scene, renderer);
 	expect(decoded_width == 1 && decoded_height == 4,
 	       "tiny positive aspect decodes to width one");
-	memset(options, 0, sizeof *options);
-	memset(plan, 0, sizeof *plan);
 	puts("unit: canonical width geometry OK");
 }
 
@@ -1091,15 +1109,11 @@ asset_metadata_tests(App *run)
 		   scene->nassets == 4096 && scene->assets[0].aspect == 2 &&
 		   scene->assets[4095].aspect == 2,
 	       "valid existing URLs remain usable at full capacity");
-	freechat(scene, renderer);
-	memset(options, 0, sizeof *options);
-	memset(plan, 0, sizeof *plan);
 }
 
 static void
 width_decode_tests(App *run)
 {
-	Options *options = &run->options;
 	Chat *scene = &run->chat;
 	Glyphs *glyphs = &run->glyphs;
 	Renderer *renderer = &run->renderer;
@@ -1116,6 +1130,7 @@ width_decode_tests(App *run)
 	char hash[65], *path;
 	size_t i, j, index;
 
+	unit_work(run);
 	glyphs->emote_height = 4;
 	glyphs->lane_height = 6;
 	glyphs->gap = 2;
@@ -1188,8 +1203,6 @@ width_decode_tests(App *run)
 		free(path);
 		freechat(scene, renderer);
 	}
-	memset(options, 0, sizeof *options);
-	memset(plan, 0, sizeof *plan);
 	puts("unit: canonical PNG and GIF dimensions OK");
 }
 
@@ -1309,6 +1322,7 @@ cache_cleanup_tests(App *run)
 	wchar_t *w;
 	HANDLE held;
 
+	unit_work(run);
 	expect(!cache->directory && !cache->payload,
 	       "no active cache stage before cleanup fixture");
 	cache->directory = private_directory(work->directory);
@@ -1336,91 +1350,133 @@ cache_cleanup_tests(App *run)
 	free(payload);
 #else
 	(void)run;
+	puts("unit: held cache cleanup SKIP, requires Windows delete sharing");
 #endif
 }
 
-static void
-storage_failure_tests(App *run, const char *program)
+static char *
+fault_case(App *run, const char *const *args, int expected, const char *error,
+	   const char *marker)
 {
-	const char *args[] = {program, "--frame-storage-oom", "1", NULL};
-	char *path;
+	char *path, *output;
 	unsigned char *diagnostic;
-	size_t length;
-	int status, closed, allocation;
+	size_t length, from, to;
+	int status, closed;
 
-	path = format("%s/storage.stderr", run->work.directory);
+	path = format("%s/fault.stderr", run->work.directory);
+	run->work.log = SDL_IOFromFile(path, "wb");
+	check(run->work.log != NULL, "open fault log");
+	spawn(&run->child, args, 0, 1, run->work.log);
+	closed = SDL_CloseIO(run->work.log);
+	run->work.log = NULL;
+	check(closed, "close fault log");
+	output = SDL_ReadProcess(run->child, &length, &status);
+	check(output != NULL, "read fault process output");
+	expect(length < MAX_JSON, "bounded fault output");
+	SDL_DestroyProcess(run->child);
+	run->child = NULL;
+	diagnostic = readfile(path, MAX_JSON, &length);
+	for (from = to = 0; from < length; from++)
+		if (diagnostic[from] != '\r' || diagnostic[from + 1] != '\n')
+			diagnostic[to++] = diagnostic[from];
+	diagnostic[to] = 0;
+	printf("unit: %s exit %d expected %d\n%s%s", args[1], status, expected,
+	       output, diagnostic);
+	expect(status == expected, "exact intentional fault status");
+	expect(strstr((const char *)diagnostic, error) != NULL,
+	       "intended fault diagnostic");
+	expect(!strstr((const char *)diagnostic, "AddressSanitizer") &&
+		   !strstr((const char *)diagnostic, "runtime error:") &&
+		   !strstr((const char *)diagnostic, "test failed:"),
+	       "intentional fault has no sanitizer or test error");
+	if (marker)
+		expect(strstr((const char *)diagnostic, marker) != NULL,
+		       "fault cleanup owner-clearance marker");
+	else
+		expect(!strcmp((const char *)diagnostic, error),
+		       "exact orderly OOM diagnostic");
+	free(diagnostic);
+	free(path);
+	return output;
+}
+
+static void
+storage_failure_tests(App *run)
+{
+	const char *args[] = {unit_program, "--frame-storage-oom", "1", NULL};
+	char *output;
+	int allocation;
+
+	unit_work(run);
 	for (allocation = 1; allocation <= 2; allocation++) {
 		args[2] = allocation == 1 ? "1" : "2";
-		run->work.log = SDL_IOFromFile(path, "wb");
-		check(run->work.log != NULL, "open storage failure log");
-		spawn(&run->child, args, 0, 0, run->work.log);
-		closed = SDL_CloseIO(run->work.log);
-		run->work.log = NULL;
-		check(closed, "close storage failure log");
-		check(SDL_WaitProcess(run->child, true, &status),
-		      "wait for storage failure");
-		SDL_DestroyProcess(run->child);
-		run->child = NULL;
-		diagnostic = readfile(path, MAX_JSON, &length);
-		expect(status == 1 &&
-			   strstr((const char *)diagnostic, "out of memory") &&
-			   strstr((const char *)diagnostic,
-				  "failed frame allocation leaves zero "
-				  "retained bytes"),
-		       "frame and delay array allocation failures release all "
-		       "retained frames");
-		free(diagnostic);
+		output =
+		    fault_case(run, args, 1, "bullet: out of memory\n",
+			       "unit: failed frame allocation leaves zero "
+			       "retained bytes\n");
+		expect(!*output, "frame OOM has no stdout");
+		SDL_free(output);
 	}
-	check(SDL_RemovePath(path), "remove storage failure log");
-	free(path);
 	puts("unit: both frame owner-array allocation failures clean retained "
 	     "storage OK");
 }
 
 static void
-tests(App *run, const char *program)
+replacement_failure_tests(App *run)
 {
-	Options *options = &run->options;
-	Chat *scene = &run->chat;
-	Glyphs *glyphs = &run->glyphs;
-	Renderer *renderer = &run->renderer;
-	RenderPlan *plan = &run->renderer.plan;
-	OutputWork *work = &run->work;
-	CacheStage *cache = &run->cache_stage;
-	SDL_Process **child = &run->child;
-	SDL_Surface *a = NULL, *b = NULL;
-	unsigned char *pixel;
-	char hash[65], *destination, *cached;
-	const char *tmp;
-	cJSON *json;
-	Message *m;
-	size_t index, i;
-	int r, w, blue, w2, num, den;
-	int64_t utc;
-	const char *youtube =
-	    "{\"replayChatItemAction\":{\"videoOffsetTimeMsec\":\"0\","
-	    "\"actions\":[{\"addChatItemAction\":{\"item\":{"
-	    "\"liveChatTextMessageRenderer\":{\"timestampUsec\":\"500000\","
-	    "\"message\":{\"simpleText\":\"waiting\"}}}}}]}}\n"
-	    "{\"replayChatItemAction\":{\"videoOffsetTimeMsec\":\"2000\","
-	    "\"actions\":[{\"addChatItemAction\":{\"item\":{"
-	    "\"liveChatTextMessageRenderer\":{\"timestampUsec\":\"3000000\","
-	    "\"message\":{\"runs\":[{\"text\":\"hello\"},{\"emoji\":{"
-	    "\"isCustomEmoji\":true,\"image\":{\"thumbnails\":["
-	    "{\"url\":\"https://example.com/a.png\",\"width\":32,"
-	    "\"height\":16}]}}}]}}}}}]}}";
+	const char *args[] = {unit_program, "--replacement-oom", NULL};
+	char *output;
 
-	storage_tests(run);
-	blend_tests(run);
-	sprite_tests(run);
-	subpixel_motion_tests(run);
-	frame_bounds_tests(run);
-	lane_tests();
-	plan_tests();
-	replan_tests(run);
-	width_geometry_tests(run);
-	asset_metadata_tests(run);
-	asset_frame_tests(run);
+	unit_work(run);
+	output = fault_case(run, args, 1, "bullet: out of memory\n", NULL);
+	expect(!*output, "replacement OOM has no stdout");
+	SDL_free(output);
+}
+
+static void
+release_failure_tests(App *run)
+{
+	const char *args[] = {
+	    unit_program, "--release-mismatch", NULL, NULL, NULL, NULL};
+	const char *forms[] = {"dense", "packed"};
+	const char *ledgers[] = {"underflow", "invalid"};
+	const char *boundaries[] = {"normal", "atexit"};
+	char *output, *marker;
+	size_t form, ledger, boundary;
+
+	unit_work(run);
+	for (form = 0; form < 2; form++) {
+		for (ledger = 0; ledger < 2; ledger++) {
+			for (boundary = 0; boundary < 2; boundary++) {
+				args[2] = forms[form];
+				args[3] = ledgers[ledger];
+				args[4] = boundaries[boundary];
+				marker = format(
+				    "unit: mismatch teardown cleared "
+				    "all owners, retained %zu bytes\n",
+				    ledger ? MAX_MEMORY + 1 : (size_t)1);
+				printf("unit: mismatch %s %s %s\n", args[2],
+				       args[3], args[4]);
+				output = fault_case(
+				    run, args, boundary ? 23 : 1,
+				    "retained image storage release mismatch",
+				    marker);
+				expect(!*output, "mismatch has no stdout");
+				SDL_free(output);
+				free(marker);
+			}
+		}
+	}
+}
+
+static void
+clock_hash_tests(App *run)
+{
+	char hash[65];
+	int num, den;
+	int64_t utc;
+
+	(void)run;
 	rate("30000/1001", &num, &den);
 	expect(num == 30000 && den == 1001, "rational fps");
 	rate("113394000/3780913", &num, &den);
@@ -1435,6 +1491,14 @@ tests(App *run, const char *program)
 	expect(!strcmp(hash, "ba7816bf8f01cfea414140de5dae2223"
 			     "b00361a396177a9cb410ff61f20015ad"),
 	       "SHA-256 cache names");
+}
+
+static void
+alpha_tests(App *run)
+{
+	Renderer *renderer = &run->renderer;
+	SDL_Surface *a = NULL, *b = NULL;
+	unsigned char *pixel;
 
 	surface_create(renderer, &a, 1, 1);
 	surface_create(renderer, &b, 1, 1);
@@ -1455,19 +1519,31 @@ tests(App *run, const char *program)
 	paste(a, b, 2, 2);
 	surface_destroy(renderer, &a);
 	surface_destroy(renderer, &b);
+}
 
-	tmp = SDL_getenv("TEMP");
-	if (!tmp)
-		tmp = SDL_getenv("TMPDIR");
-	if (!tmp)
-		tmp = "/tmp";
-	destination = format("%s/bullet-unit.mp4", tmp);
-	beginwork(work, destination);
-	free(destination);
+static void
+chat_clock_tests(App *run)
+{
+	Options *options = &run->options;
+	Chat *scene = &run->chat;
+	Renderer *renderer = &run->renderer;
+	OutputWork *work = &run->work;
+	cJSON *json;
+	const char *youtube =
+	    "{\"replayChatItemAction\":{\"videoOffsetTimeMsec\":\"0\","
+	    "\"actions\":[{\"addChatItemAction\":{\"item\":{"
+	    "\"liveChatTextMessageRenderer\":{\"timestampUsec\":\"500000\","
+	    "\"message\":{\"simpleText\":\"waiting\"}}}}}]}}\n"
+	    "{\"replayChatItemAction\":{\"videoOffsetTimeMsec\":\"2000\","
+	    "\"actions\":[{\"addChatItemAction\":{\"item\":{"
+	    "\"liveChatTextMessageRenderer\":{\"timestampUsec\":\"3000000\","
+	    "\"message\":{\"runs\":[{\"text\":\"hello\"},{\"emoji\":{"
+	    "\"isCustomEmoji\":true,\"image\":{\"thumbnails\":["
+	    "{\"url\":\"https://example.com/a.png\",\"width\":32,"
+	    "\"height\":16}]}}}]}}}}}]}}";
+
+	unit_work(run);
 	work->stage = format("%s/chat.json", work->directory);
-	cache_cleanup_tests(run);
-	storage_failure_tests(run, program);
-	width_decode_tests(run);
 	writefile(work->stage, youtube, strlen(youtube));
 	readchat(scene, options->hls, options->origin, work->stage);
 	expect(scene->nmessages == 1 && scene->messages[0].time == 2 * SECOND,
@@ -1489,12 +1565,28 @@ tests(App *run, const char *program)
 	expect(scene->messages[0].time == 6100000, "explicit HLS clock");
 	cJSON_Delete(json);
 	freechat(scene, renderer);
-	options->hls = 0;
+}
 
+static void
+animated_render_tests(App *run)
+{
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &renderer->plan;
+	OutputWork *work = &run->work;
+	CacheStage *cache = &run->cache_stage;
+	SDL_Process **child = &run->child;
+	Message *m;
+	unsigned char *pixel;
+	char hash[65], *cached;
+	size_t index;
+	int r, w, blue, w2;
+
+	unit_work(run);
 	plan->travel = 10 * SECOND;
 	plan->opacity = 50;
-	options->font = SDL_getenv("BULLET_TEST_FONT");
-	openfont(glyphs, options->font, 200, 80);
+	openfont(glyphs, SDL_getenv("BULLET_TEST_FONT"), 200, 80);
 	index = asset(scene, "https://example.com/animated.gif", 1);
 	scene->assets[index].embedded = copystr(gif);
 	scene->assets[index].target_width = glyphs->emote_height;
@@ -1544,7 +1636,19 @@ tests(App *run, const char *program)
 	cached = format("%s/%s", work->directory, hash);
 	check(SDL_RemovePath(cached), "remove test cache");
 	free(cached);
-	freechat(scene, renderer);
+}
+
+static void
+text_lane_tests(App *run)
+{
+	Chat *scene = &run->chat;
+	Glyphs *glyphs = &run->glyphs;
+	Renderer *renderer = &run->renderer;
+	RenderPlan *plan = &renderer->plan;
+	Message *m;
+	size_t i;
+
+	openfont(glyphs, SDL_getenv("BULLET_TEST_FONT"), 200, 80);
 	plan->travel = default_travel;
 	for (i = 0; i < 3; i++) {
 		m = message(scene, 0);
@@ -1562,12 +1666,6 @@ tests(App *run, const char *program)
 		expect(scene->messages[i].time == 0 &&
 			   scene->messages[i].y == 0,
 		       "crowding never postpones a comment");
-	freechat(scene, renderer);
-	endwork(work, cache);
-	surface_destroy(renderer, &renderer->canvas);
-	expect(renderer->retained.bytes == 0,
-	       "native retained image destruction reaches zero");
-	puts("unit: clock, JSON, alpha, GIF, cache, layout OK");
 }
 
 static unsigned int cli_checks;
@@ -1604,6 +1702,9 @@ command_case(App *run, int success, const char *error, const char *program,
 	*child = NULL;
 	diagnostic = readfile(path, MAX_JSON, &length);
 	free(path);
+	expect(!strstr((const char *)diagnostic, "AddressSanitizer") &&
+		   !strstr((const char *)diagnostic, "runtime error:"),
+	       "CLI command has no sanitizer error");
 	if ((status == 0) != success ||
 	    (!success && !strcmp(program, cli_program) && status != 1) ||
 	    (error && !strstr((const char *)diagnostic, error))) {
@@ -2050,8 +2151,9 @@ held_cross_exit(void)
 }
 
 static void
-cross_cleanup_retry(void)
+cross_cleanup_retry(App *run)
 {
+	(void)run;
 #ifdef _WIN32
 	char *owner, *nested, *path;
 	wchar_t *w;
@@ -2091,6 +2193,61 @@ cross_cleanup_retry(void)
 #else
 	puts("unit: held cross cleanup retry SKIP, requires Windows delete "
 	     "sharing");
+#endif
+}
+
+static void
+held_exit_tests(App *run)
+{
+#ifdef _WIN32
+	const char *args[] = {unit_program, "--held-cross-exit", NULL};
+	const char *prefix = "held cross fixture ";
+	char *output, *owner, *path, *allowed;
+	unsigned char *bytes, *diagnostic;
+	size_t n, entries;
+
+	unit_work(run);
+	output = fault_case(run, args, 23,
+			    "bullet: cannot remove cross-filesystem fixture:",
+			    "bullet: intentional held cross fixture exit\n");
+	expect(!strncmp(output, prefix, strlen(prefix)),
+	       "held child reports its exclusively owned fixture");
+	owner = output + strlen(prefix);
+	n = strlen(owner);
+	expect(n && owner[n - 1] == '\n', "held fixture output ends once");
+	owner[--n] = 0;
+	if (n && owner[n - 1] == '\r')
+		owner[--n] = 0;
+	allowed = format("%s/.bullet-cross-", SDL_GetBasePath());
+	expect(!strncmp(owner, allowed, strlen(allowed)) &&
+		   owner[strlen(allowed)] &&
+		   strspn(owner + strlen(allowed), "0123456789-") ==
+		       strlen(owner + strlen(allowed)),
+	       "held fixture is the exact child-owned executable-side path");
+	free(allowed);
+	path = format("%s/fault.stderr", run->work.directory);
+	diagnostic = readfile(path, MAX_JSON, &n);
+	expect(strstr((const char *)diagnostic, owner) != NULL,
+	       "refusal diagnostic names the exact retained fixture");
+	free(diagnostic);
+	free(path);
+	entries = 0;
+	check(SDL_EnumerateDirectory(owner, count_entry, &entries),
+	      "inspect exact refused-removal fixture");
+	expect(entries == 1, "held fixture contains only the owned payload");
+	path = format("%s/held", owner);
+	bytes = readfile(path, 1, &n);
+	expect(n == 1 && bytes[0] == 'x', "held fixture payload unchanged");
+	free(bytes);
+	check(SDL_RemovePath(path), "remove exact exited child's payload");
+	check(SDL_RemovePath(owner), "remove exact exited child's fixture");
+	expect(!exists(path) && !exists(owner),
+	       "parent removes only the checked fixture after child exits");
+	free(path);
+	SDL_free(output);
+#else
+	(void)run;
+	puts("unit: held cross exit SKIP, requires Windows delete sharing");
 #endif
 }
 
@@ -2258,7 +2415,6 @@ cli_tests(App *run, const char *bullet, const char *tool)
 {
 	Renderer *renderer = &run->renderer;
 	OutputWork *work = &run->work;
-	CacheStage *cache = &run->cache_stage;
 	SDL_Process **child = &run->child;
 	const char *tmp, *test_font;
 	const char *version[] = {bullet, "--version", NULL};
@@ -2724,11 +2880,253 @@ cli_tests(App *run, const char *bullet, const char *tool)
 	free(result);
 	free(saved);
 	free(invalid);
-	check(SDL_EnumerateDirectory(work->directory, remove_entry, NULL),
-	      "clean CLI fixtures");
-	endwork(work, cache);
 	printf("cli: %u native process checks passed; inputs unchanged\n",
 	       cli_checks);
+}
+
+static void
+fixture_empty(const App *run)
+{
+	expect(
+	    !run->chat.messages && !run->chat.assets && !run->chat.nmessages &&
+		!run->chat.nassets && !run->chat.nparts,
+	    "fixture Chat arrays, parts, strings, frames and sprites empty");
+	expect(!run->glyphs.font,
+	       "fixture font owner empty after native case");
+	expect(!run->renderer.canvas, "fixture canvas owner empty");
+	expect(!run->work.directory && !run->work.stage &&
+		   !run->work.asset_temp && !run->work.logpath &&
+		   !run->work.log,
+	       "fixture work paths and log owners empty");
+	expect(!run->cache_stage.directory && !run->cache_stage.payload,
+	       "fixture cache stage owners empty");
+	expect(!run->child && !run->inferred_chat && !run->inferred_output &&
+		   !run->chat_context && !cross_fixture &&
+		   !frame_storage_source,
+	       "fixture process, inferred paths and test owners empty");
+	expect(run->renderer.retained.bytes == 0,
+	       "fixture retained image storage reaches zero without reset");
+}
+
+static void
+fixture_begin(App *run)
+{
+	Options defaults = {0};
+	Glyphs empty_glyphs = {0};
+	RenderPlan empty_plan = {0};
+
+	fixture_empty(run);
+	defaults.duration = -1;
+	defaults.travel = default_travel;
+	defaults.opacity = default_opacity;
+	defaults.dir = "data";
+	defaults.max_height = 720;
+	run->options = defaults;
+	run->glyphs = empty_glyphs;
+	run->renderer.plan = empty_plan;
+	run->renderer.dense_reference = 0;
+	run->work.keep_log = 0;
+	run->fail_next_resize = run->fail_embedded_replacement = 0;
+}
+
+static void
+fixture_ready(const App *run)
+{
+	const Options *o = &run->options;
+	const RenderPlan *p = &run->renderer.plan;
+	const Glyphs *g = &run->glyphs;
+
+	fixture_empty(run);
+	expect(!o->video && !o->chat && !o->output && !o->font && !o->url &&
+		   o->dir && !strcmp(o->dir, "data") && !o->start &&
+		   o->duration == -1 && o->travel == default_travel &&
+		   !o->origin && !o->fps_num && !o->fps_den && !o->height &&
+		   o->opacity == default_opacity && !o->shadow && !o->force &&
+		   !o->hls && o->max_height == 720,
+	       "independent case has default options");
+	expect(!p->width && !p->height && !p->fps_num && !p->fps_den &&
+		   !p->start && !p->duration && !p->travel && !p->opacity &&
+		   !p->shadow && !g->font_size && !g->outline && !g->gap &&
+		   !g->lane_height && !g->emote_height &&
+		   !run->renderer.dense_reference && !run->work.keep_log &&
+		   !run->fail_next_resize && !run->fail_embedded_replacement,
+	       "independent case has empty plan, metrics and failure hooks");
+}
+
+static void
+fixture_end(App *run)
+{
+	int status;
+	char *directory =
+	    run->work.directory ? copystr(run->work.directory) : NULL;
+
+	if (run->child) {
+		SDL_KillProcess(run->child, true);
+		check(SDL_WaitProcess(run->child, true, &status),
+		      "wait for fixture-owned child");
+		SDL_DestroyProcess(run->child);
+		run->child = NULL;
+	}
+	if (run->work.log) {
+		status = SDL_CloseIO(run->work.log);
+		run->work.log = NULL;
+		check(status, "close fixture-owned log");
+	}
+	check(end_cache_stage(&run->cache_stage),
+	      "release fixture cache stage");
+	if (run->work.directory)
+		check(SDL_EnumerateDirectory(run->work.directory, remove_entry,
+					     NULL),
+		      "remove only exclusively owned fixture contents");
+	endwork(&run->work, &run->cache_stage);
+	check(end_cross_fixture(), "release owned cross fixture");
+	expect(freechat(&run->chat, &run->renderer),
+	       "release every fixture string, frame and sprite");
+	expect(surface_destroy(&run->renderer, &run->renderer.canvas),
+	       "release fixture canvas charge");
+	if (run->glyphs.font) {
+		TTF_CloseFont(run->glyphs.font);
+		run->glyphs.font = NULL;
+		TTF_Quit();
+	}
+	free(run->inferred_chat);
+	free(run->inferred_output);
+	run->inferred_chat = run->inferred_output = NULL;
+	fixture_empty(run);
+	if (directory) {
+		expect(!exists(directory), "fixture work directory removed");
+		free(directory);
+	}
+}
+
+static void
+fixture_ownership_tests(App *run)
+{
+	Message *m;
+	Asset *a;
+	SDL_Surface *source;
+	const char *args[] = {unit_program, "--version", NULL};
+	int status;
+
+	unit_work(run);
+	run->work.stage = format("%s/stage", run->work.directory);
+	writefile(run->work.stage, "stage", 5);
+	writefile(run->work.asset_temp, "encoded", 7);
+	run->work.log = SDL_IOFromFile(run->work.logpath, "wb");
+	check(run->work.log != NULL, "create owned boundary log");
+	run->cache_stage.directory = private_directory(run->work.directory);
+	run->cache_stage.payload =
+	    format("%s/payload", run->cache_stage.directory);
+	writefile(run->cache_stage.payload, "cache", 5);
+	m = message(&run->chat, 123456);
+	part(&run->chat, m, "owned boundary text", NONE);
+	m->sprite = resize(NULL, 1, sizeof *m->sprite);
+	memset(m->sprite, 0, sizeof *m->sprite);
+	surface_create(&run->renderer, &m->sprite->pixels, 8, 2);
+	((unsigned char *)m->sprite->pixels->pixels)[3] = 255;
+	sprite_pack(&run->renderer, m->sprite);
+	a = &run->chat.assets[asset(&run->chat,
+				    "https://example.com/boundary.png", 1)];
+	a->embedded = copystr("owned boundary encoded bytes");
+	a->target_width = 2;
+	source = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32);
+	check(source != NULL, "create boundary source");
+	asset_frame(&run->renderer, 2, a, source, 100);
+	SDL_DestroySurface(source);
+	surface_create(&run->renderer, &run->renderer.canvas, 2, 2);
+	openfont(&run->glyphs, SDL_getenv("BULLET_TEST_FONT"), 200, 80);
+	run->inferred_chat = copystr("owned inferred chat");
+	run->inferred_output = copystr("owned inferred output");
+	run->options.chat = run->inferred_chat;
+	run->options.output = run->inferred_output;
+	run->options.hls = 1;
+	run->options.origin = 654321;
+	run->renderer.plan.start = 123456;
+	run->renderer.plan.travel = 987654;
+	run->renderer.dense_reference = 1;
+	spawn(&run->child, args, 0, 0, run->work.log);
+	check(SDL_WaitProcess(run->child, true, &status),
+	      "wait for boundary child without destroying its owner");
+	expect(status == 0 && run->chat.nmessages == 1 &&
+		   run->chat.nparts == 1 && run->chat.nassets == 1 &&
+		   m->sprite->runs && !m->sprite->pixels && a->count == 1 &&
+		   run->renderer.retained.bytes == 48 && run->glyphs.font &&
+		   run->child && run->work.log,
+	       "boundary owns literal text, packed sprite, frame, canvas, "
+	       "font, process, log and paths before real cleanup");
+}
+
+typedef struct {
+	const char *name;
+	void (*callback)(App *run);
+} UnitCase;
+
+static const UnitCase unit_cases[] = {
+    {"fixture-ownership", fixture_ownership_tests},
+    {"embedded-replacement", replacement_tests},
+    {"retained-storage", storage_tests},
+    {"alpha-pairs", blend_tests},
+    {"packed-sprites", sprite_tests},
+    {"subpixel-motion", subpixel_motion_tests},
+    {"frame-bounds", frame_bounds_tests},
+    {"numeric-lanes", lane_tests},
+    {"immutable-plan", plan_tests},
+    {"visible-replanning", replan_tests},
+    {"width-geometry", width_geometry_tests},
+    {"asset-metadata", asset_metadata_tests},
+    {"asset-frame-time", asset_frame_tests},
+    {"clock-hash", clock_hash_tests},
+    {"straight-alpha", alpha_tests},
+    {"chat-clocks", chat_clock_tests},
+    {"width-decode", width_decode_tests},
+    {"animated-render-cache", animated_render_tests},
+    {"text-lanes", text_lane_tests},
+    {"held-cache-cleanup", cache_cleanup_tests},
+    {"held-cross-cleanup", cross_cleanup_retry},
+    {"replacement-oom", replacement_failure_tests},
+    {"frame-storage-oom", storage_failure_tests},
+    {"release-mismatch", release_failure_tests},
+    {"held-cross-exit", held_exit_tests}};
+
+static void
+unit_run(App *run, const UnitCase *test, unsigned int repetition)
+{
+	printf("unit: begin %s repetition %u\n", test->name, repetition);
+	fflush(stdout);
+	fixture_begin(run);
+	fixture_ready(run);
+	test->callback(run);
+	fixture_end(run);
+	fixture_empty(run);
+	printf("unit: end %s repetition %u, all owners empty, retained 0\n",
+	       test->name, repetition);
+}
+
+static void
+unit_named(App *run, const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof unit_cases / sizeof *unit_cases; i++)
+		if (!strcmp(unit_cases[i].name, name)) {
+			unit_run(run, &unit_cases[i], 1);
+			return;
+		}
+	die("unknown native case: %s", name);
+}
+
+static void
+unit_tests(App *run, int reverse, unsigned int repetitions)
+{
+	size_t i, count = sizeof unit_cases / sizeof *unit_cases;
+	unsigned int repetition;
+
+	for (repetition = 1; repetition <= repetitions; repetition++)
+		for (i = 0; i < count; i++)
+			unit_run(run, &unit_cases[reverse ? count - 1 - i : i],
+				 repetition);
+	printf("unit: %zu independent cases, %s, %u repetitions passed\n",
+	       count, reverse ? "reverse" : "forward", repetitions);
 }
 
 int
@@ -2741,7 +3139,24 @@ main(int argc, char **argv)
 	check(SDL_Init(0), "initialize SDL");
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
 		die("initialize HTTP library");
+	unit_program = argv[0];
 	if (argc > 1) {
+		if (argc == 3 && !strcmp(argv[1], "--unit-case")) {
+			unit_named(run, argv[2]);
+			return 0;
+		}
+		if (argc == 3 && !strcmp(argv[1], "--unit-order")) {
+			expect(!strcmp(argv[2], "forward") ||
+				   !strcmp(argv[2], "reverse"),
+			       "native order is forward or reverse");
+			unit_tests(run, !strcmp(argv[2], "reverse"), 1);
+			return 0;
+		}
+		if (argc == 2 && !strcmp(argv[1], "--unit-repeat")) {
+			unit_tests(run, 0, 2);
+			unit_tests(run, 1, 2);
+			return 0;
+		}
 		if (SDL_getenv("BULLET_REFERENCE_ENCODER") &&
 		    *SDL_getenv("BULLET_REFERENCE_ENCODER") &&
 		    (!SDL_strcasecmp(basenameof(argv[0]), "ffmpeg") ||
@@ -2758,7 +3173,7 @@ main(int argc, char **argv)
 			return 0;
 		}
 		if (!strcmp(argv[1], "--storage")) {
-			storage_tests(run);
+			unit_named(run, "retained-storage");
 			return 0;
 		}
 		if (argc == 5 && !strcmp(argv[1], "--release-mismatch"))
@@ -2772,21 +3187,21 @@ main(int argc, char **argv)
 		if (!strcmp(argv[1], "--held-cross-exit"))
 			held_cross_exit();
 		if (!strcmp(argv[1], "--cross-cleanup-retry")) {
-			cross_cleanup_retry();
+			unit_named(run, "held-cross-cleanup");
 			return 0;
 		}
 		if (!strcmp(argv[1], "--owners")) {
-			lane_tests();
-			plan_tests();
-			replan_tests(run);
+			unit_named(run, "numeric-lanes");
+			unit_named(run, "immutable-plan");
+			unit_named(run, "visible-replanning");
 			return 0;
 		}
 		if (!strcmp(argv[1], "--replan")) {
-			replan_tests(run);
+			unit_named(run, "visible-replanning");
 			return 0;
 		}
 		if (!strcmp(argv[1], "--width-geometry")) {
-			width_geometry_tests(run);
+			unit_named(run, "width-geometry");
 			return 0;
 		}
 		if (!strcmp(argv[1], "--version")) {
@@ -2794,7 +3209,10 @@ main(int argc, char **argv)
 			return 0;
 		}
 		if (argc == 3 && !strcmp(argv[1], "--cli")) {
+			fixture_begin(run);
+			fixture_ready(run);
 			cli_tests(run, argv[2], argv[0]);
+			fixture_end(run);
 			return 0;
 		}
 		if (!strcmp(argv[1], "chatdownload") ||
@@ -2821,8 +3239,6 @@ main(int argc, char **argv)
 			       &app.child);
 		return 0;
 	}
-	cross_cleanup_retry();
-	replacement_tests(run);
-	tests(run, argv[0]);
+	unit_tests(run, 0, 1);
 	return 0;
 }

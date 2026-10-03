@@ -60,6 +60,19 @@ Tests use Meiryo Bold on Windows by default. If that font is unavailable, set
 Tests use local media fixtures and fake downloaders; real downloads require the
 additional tools described in [README.md](README.md).
 
+CTest runs every named native case in forward, reverse, and repeated order. Each
+case starts with default options and ends with empty resource owners and zero
+retained image bytes. The native gates also check exact intentional failure
+statuses and cleanup diagnostics. Windows-only held-file cases report a skip on
+other platforms. Run a single case with the test executable, for example:
+
+```powershell
+build/Release/bullet-test.exe --unit-case animated-render-cache
+```
+
+Use `--unit-order forward`, `--unit-order reverse`, or `--unit-repeat` to run the
+full native registry. These flags belong only to the test executable.
+
 For changes to C code, also configure, build, and test with sanitizers in a separate
 build directory:
 

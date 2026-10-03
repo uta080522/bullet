@@ -27,9 +27,11 @@ if(BUILD_TESTING)
   add_executable(bullet-test test.c)
   list(APPEND programs bullet-test)
   add_test(NAME unit COMMAND bullet-test)
+  add_test(NAME unit-reverse COMMAND bullet-test --unit-order reverse)
+  add_test(NAME unit-repeat COMMAND bullet-test --unit-repeat)
   add_test(NAME cli COMMAND bullet-test --cli "$<TARGET_FILE:bullet>")
   if(SANITIZE)
-    set_tests_properties(unit cli PROPERTIES ENVIRONMENT
+    set_tests_properties(unit unit-reverse unit-repeat cli PROPERTIES ENVIRONMENT
       "ASAN_OPTIONS=halt_on_error=1:exitcode=86;UBSAN_OPTIONS=halt_on_error=1:exitcode=87")
   endif()
 endif()
