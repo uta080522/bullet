@@ -29,6 +29,8 @@ bullet render VIDEO --start 60 --duration 15 --output clip.mp4
 
 Use `--font` to select a font, `--force` to replace an existing output, and `bullet --help` for all options. Windows uses Meiryo Bold by default. bullet saves downloaded emotes in `assets/` next to the chat file; it copies the audio stream into the output. The source video's average frame rate determines the output's constant frame rate.
 
+Emote verification uses private scratch files beside the output. New cache entries keep the original validated encoded bytes and use private staging inside `assets/`, so the cache and output can be on different filesystems. Existing cache entries require no cache writes and can be read-only.
+
 Scrolling text, images and GIFs use subpixel positioning to reduce jitter from whole-pixel rounding. Their timing and crossing speed are unchanged.
 
 ## Building

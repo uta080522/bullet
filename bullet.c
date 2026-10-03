@@ -105,6 +105,10 @@ typedef struct {
 	int max_height;
 } Options;
 
+typedef struct {
+	char *directory, *payload;
+} CacheStage;
+
 static Options opt;
 static Message *messages;
 static Asset *assets;
@@ -113,6 +117,7 @@ static TTF_Font *font;
 static SDL_Surface *canvas;
 static SDL_Process *child;
 static char *workdir, *stage, *asset_temp, *logpath;
+static CacheStage cache_stage;
 static char *inferred_chat, *inferred_output;
 static int keep_log;
 static const char *chat_context;
@@ -457,9 +462,27 @@ freechat(void)
 	nmessages = nassets = nparts = 0;
 }
 
+static int
+end_cache_stage(void)
+{
+	if (cache_stage.payload && !SDL_RemovePath(cache_stage.payload) &&
+	    exists(cache_stage.payload))
+		return 0;
+	if (cache_stage.directory && !SDL_RemovePath(cache_stage.directory))
+		return 0;
+	free(cache_stage.payload);
+	free(cache_stage.directory);
+	cache_stage.payload = cache_stage.directory = NULL;
+	return 1;
+}
+
 static void
 endwork(void)
 {
+	if (!end_cache_stage())
+		fprintf(stderr,
+			"bullet: cannot remove private cache staging: %s\n",
+			cache_stage.directory);
 	if (asset_temp)
 		SDL_RemovePath(asset_temp);
 	if (stage)
@@ -499,37 +522,43 @@ cleanup(void)
 	SDL_Quit();
 }
 
-static void
-beginwork(const char *destination)
+static char *
+private_directory(const char *dir)
 {
-	char *dir;
+	char *path;
 	unsigned int attempt;
 	int ok;
 #ifdef _WIN32
 	wchar_t *w;
 #endif
 
-	dir = dirnameof(destination);
-	check(SDL_CreateDirectory(dir), "create output directory");
 	for (attempt = 0; attempt < 100; attempt++) {
-		workdir = format(
-		    "%s/.bullet-%llu-%u", dir,
-		    (unsigned long long)SDL_GetPerformanceCounter(), attempt);
+		path = format("%s/.bullet-%llu-%u", dir,
+			      (unsigned long long)SDL_GetPerformanceCounter(),
+			      attempt);
 #ifdef _WIN32
-		w = wide(workdir);
+		w = wide(path);
 		ok = CreateDirectoryW(w, NULL);
 		SDL_free(w);
 #else
-		ok = mkdir(workdir, 0700) == 0;
+		ok = mkdir(path, 0700) == 0;
 #endif
 		if (ok)
-			break;
-		free(workdir);
-		workdir = NULL;
+			return path;
+		free(path);
 	}
+	die("cannot create private staging directory: %s", dir);
+}
+
+static void
+beginwork(const char *destination)
+{
+	char *dir;
+
+	dir = dirnameof(destination);
+	check(SDL_CreateDirectory(dir), "create output directory");
+	workdir = private_directory(dir);
 	free(dir);
-	if (!workdir)
-		die("cannot create private output directory");
 	asset_temp = format("%s/asset", workdir);
 	logpath = format("%s/ffmpeg.log", workdir);
 }
@@ -1466,11 +1495,24 @@ load_asset(Asset *a, const char *directory)
 		asset_frame(a, frame, 100);
 		SDL_DestroySurface(frame);
 	}
-	free(bytes);
 	if (!a->count)
 		die("emote has no frames: %s", a->url);
-	if (!cached && !commitfile(asset_temp, path, 0))
-		die("cannot commit emote cache without overwriting: %s", path);
+	if (!cached) {
+		if (cache_stage.directory || cache_stage.payload)
+			die("private cache stage is already active");
+		cache_stage.directory = private_directory(directory);
+		cache_stage.payload =
+		    format("%s/asset", cache_stage.directory);
+		writefile(cache_stage.payload, bytes, length);
+		if (!commitfile(cache_stage.payload, path, 0))
+			die("cannot commit emote cache without overwriting: "
+			    "%s",
+			    path);
+		free(cache_stage.payload);
+		cache_stage.payload = NULL;
+		check(end_cache_stage(), "remove private cache staging");
+	}
+	free(bytes);
 	SDL_RemovePath(asset_temp);
 	free(path);
 }

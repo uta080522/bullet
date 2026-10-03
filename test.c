@@ -580,6 +580,42 @@ cropped_frame_test(int64_t now)
 }
 
 static void
+cache_cleanup_tests(void)
+{
+#ifdef _WIN32
+	char *directory, *payload;
+	wchar_t *w;
+	HANDLE held;
+
+	expect(!cache_stage.directory && !cache_stage.payload,
+	       "no active cache stage before cleanup fixture");
+	cache_stage.directory = private_directory(workdir);
+	cache_stage.payload = format("%s/payload", cache_stage.directory);
+	directory = copystr(cache_stage.directory);
+	payload = copystr(cache_stage.payload);
+	writefile(payload, "x", 1);
+	w = wide(payload);
+	held = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	SDL_free(w);
+	expect(held != INVALID_HANDLE_VALUE,
+	       "hold cache payload without delete sharing");
+	end_cache_stage();
+	expect(CloseHandle(held) != 0, "release held cache payload");
+	if (!cache_stage.directory)
+		fprintf(stderr, "unit: cleanup fixture %s\n", workdir);
+	expect(cache_stage.directory && cache_stage.payload && exists(payload),
+	       "failed cache cleanup retains owner");
+	end_cache_stage();
+	expect(!cache_stage.directory && !cache_stage.payload &&
+		   !exists(directory) && !exists(payload),
+	       "cache cleanup retry removes owned paths");
+	free(directory);
+	free(payload);
+#endif
+}
+
+static void
 tests(void)
 {
 	SDL_Surface *a, *b;
@@ -653,6 +689,7 @@ tests(void)
 	beginwork(destination);
 	free(destination);
 	stage = format("%s/chat.json", workdir);
+	cache_cleanup_tests();
 	writefile(stage, youtube, strlen(youtube));
 	readchat(stage);
 	expect(nmessages == 1 && messages[0].time == 2 * SECOND,
@@ -1054,6 +1091,266 @@ count_entry(void *data, const char *dir, const char *name)
 	return SDL_ENUM_CONTINUE;
 }
 
+static char *cross_fixture;
+
+static void
+end_cross_fixture(void)
+{
+	if (cross_fixture) {
+		check(
+		    SDL_EnumerateDirectory(cross_fixture, remove_entry, NULL),
+		    "clean cross-filesystem fixture");
+		check(SDL_RemovePath(cross_fixture),
+		      "remove cross-filesystem fixture");
+		free(cross_fixture);
+		cross_fixture = NULL;
+	}
+}
+
+static char *
+filesystem_id(const char *path)
+{
+#ifdef _WIN32
+	wchar_t *w, *name;
+	HANDLE handle;
+	DWORD n;
+	char *utf8, *id;
+	size_t i;
+
+	w = wide(path);
+	handle = CreateFileW(
+	    w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+	    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	SDL_free(w);
+	if (handle == INVALID_HANDLE_VALUE)
+		return NULL;
+	name = resize(NULL, 32768, sizeof *name);
+	n = GetFinalPathNameByHandleW(handle, name, 32768, VOLUME_NAME_GUID);
+	CloseHandle(handle);
+	if (!n || n >= 32768) {
+		free(name);
+		return NULL;
+	}
+	for (i = 0; i < n && name[i] != L'}'; i++)
+		;
+	if (i == n) {
+		free(name);
+		return NULL;
+	}
+	name[++i] = 0;
+	utf8 = SDL_iconv_string("UTF-8", "UTF-16LE", (const char *)name,
+				(i + 1) * sizeof *name);
+	expect(utf8 != NULL, "convert volume identity");
+	id = copystr(utf8);
+	SDL_free(utf8);
+	free(name);
+	return id;
+#else
+	struct stat st;
+
+	if (stat(path, &st))
+		return NULL;
+	return format("%llu", (unsigned long long)st.st_dev);
+#endif
+}
+
+static char *
+cross_directory(const char *root)
+{
+	char *path;
+	unsigned int attempt;
+	int ok;
+#ifdef _WIN32
+	wchar_t *w;
+	DWORD error;
+#else
+	int error;
+#endif
+
+	for (attempt = 0; attempt < 100; attempt++) {
+		path = format("%s/.bullet-cross-%llu-%u", root,
+			      (unsigned long long)SDL_GetPerformanceCounter(),
+			      attempt);
+#ifdef _WIN32
+		w = wide(path);
+		ok = CreateDirectoryW(w, NULL);
+		error = GetLastError();
+		SDL_free(w);
+#else
+		ok = mkdir(path, 0700) == 0;
+		error = errno;
+#endif
+		if (ok)
+			return path;
+		free(path);
+#ifdef _WIN32
+		if (error != ERROR_ALREADY_EXISTS)
+#else
+		if (error != EEXIST)
+#endif
+			return NULL;
+	}
+	return NULL;
+}
+
+static void
+cross_cache_tests(const char *bullet, const char *source, const char *original,
+		  const char *test_font)
+{
+	const char *roots[] = {SDL_GetBasePath(),
+#ifndef _WIN32
+			       "/dev/shm",
+#endif
+			       NULL};
+	char *input_id, *output_id, *text, *dir, *chat, *saved_chat;
+	char *output, *saved_output, *cache, *encoded, *bad_chat, *bad_encoded;
+	char hash[65];
+	unsigned char *bytes;
+	size_t i, n, entries;
+#ifdef _WIN32
+	wchar_t *w;
+#endif
+
+	expect(atexit(end_cross_fixture) == 0,
+	       "register cross-filesystem fixture cleanup");
+	input_id = filesystem_id(workdir);
+	expect(input_id != NULL, "identify fixture filesystem");
+	output_id = NULL;
+	for (i = 0; roots[i]; i++) {
+		output_id = filesystem_id(roots[i]);
+		if (output_id && strcmp(input_id, output_id)) {
+			cross_fixture = cross_directory(roots[i]);
+			if (cross_fixture)
+				break;
+		}
+		free(output_id);
+		output_id = NULL;
+	}
+	if (!cross_fixture) {
+		printf(
+		    "cli: cross-filesystem cache SKIP, no writable distinct "
+		    "filesystem among fixture temp and executable roots");
+#ifndef _WIN32
+		printf(" or /dev/shm");
+#endif
+		printf("; fixture identity %s\n", input_id);
+		free(input_id);
+		return;
+	}
+	free(output_id);
+	output_id = filesystem_id(cross_fixture);
+	expect(output_id && strcmp(input_id, output_id),
+	       "owned output fixture is on a distinct filesystem");
+	printf("cli: cross-filesystem cache EXECUTED, input/cache %s, output "
+	       "%s\n",
+	       input_id, output_id);
+	fflush(stdout);
+	free(input_id);
+	free(output_id);
+	dir = fixture("cross-chat", NULL);
+	check(SDL_CreateDirectory(dir),
+	      "create cross-filesystem chat fixture");
+	chat = format("%s/chat.json", dir);
+	saved_chat = format("%s/chat-before.json", dir);
+	text = format(
+	    "{\"comments\":[{\"content_offset_seconds\":0,"
+	    "\"message\":{\"fragments\":[{\"emoticon\":{"
+	    "\"emoticon_id\":\"cross-filesystem\"}}]}}],\"embeddedData\":{"
+	    "\"firstParty\":[{\"id\":\"cross-filesystem\",\"data\":\"%s\"}]}}",
+	    gif);
+	writefile(chat, text, strlen(text));
+	free(text);
+	copyfile(chat, saved_chat);
+	cache = format("%s/assets", dir);
+	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/cross-filesystem/"
+		"default/dark/2.0",
+		hash);
+	encoded = format("%s/%s", cache, hash);
+	expect(!exists(cache), "unseen cache directory before cache miss");
+	output = format("%s/output.mp4", cross_fixture);
+	saved_output = format("%s/output-before.mp4", cross_fixture);
+	writefile(output, "existing output", 15);
+	run_case(1, bullet, "render", source, chat, "--output", output,
+		 "--force", "--duration", "0.3", "--font", test_font, NULL);
+	run_case(1, "ffmpeg", "-v", "error", "-xerror", "-i", output, "-f",
+		 "null", "-", NULL);
+	bytes = readfile(encoded, MAX_ASSET, &n);
+	text = (char *)unbase64(gif, &i);
+	expect(n == i && !memcmp(bytes, text, n),
+	       "cache publishes original encoded GIF bytes");
+	free(bytes);
+	free(text);
+	copyfile(output, saved_output);
+#ifdef _WIN32
+	w = wide(encoded);
+	expect(SetFileAttributesW(w, FILE_ATTRIBUTE_READONLY),
+	       "make fixture cache entry read-only");
+	SDL_free(w);
+#else
+	expect(chmod(encoded, 0400) == 0 && chmod(cache, 0500) == 0,
+	       "make fixture cache read-only");
+#endif
+	run_case(1, bullet, "render", source, chat, "--output", output,
+		 "--force", "--duration", "0.3", "--font", test_font, NULL);
+	samebytes(output, saved_output);
+#ifdef _WIN32
+	w = wide(encoded);
+	expect(SetFileAttributesW(w, FILE_ATTRIBUTE_NORMAL),
+	       "restore fixture cache entry attributes");
+	SDL_free(w);
+#else
+	expect(chmod(cache, 0700) == 0 && chmod(encoded, 0600) == 0,
+	       "restore fixture cache permissions");
+#endif
+	bad_chat = format("%s/bad-gif.json", dir);
+	text = format(
+	    "{\"comments\":[{\"content_offset_seconds\":0,"
+	    "\"message\":{\"fragments\":[{\"emoticon\":{"
+	    "\"emoticon_id\":\"cross-broken\"}}]}}],\"embeddedData\":{"
+	    "\"firstParty\":[{\"id\":\"cross-broken\",\"data\":\"%.*s\"}]}}",
+	    (int)strlen(gif) - 16, gif);
+	writefile(bad_chat, text, strlen(text));
+	free(text);
+	reject_case("external command failed", bullet, "render", source,
+		    bad_chat, "--output", output, "--force", "--duration",
+		    "0.3", "--font", test_font, NULL);
+	samebytes(output, saved_output);
+	hashurl("https://static-cdn.jtvnw.net/emoticons/v2/cross-broken/"
+		"default/dark/2.0",
+		hash);
+	bad_encoded = format("%s/%s", cache, hash);
+	expect(!exists(bad_encoded),
+	       "invalid GIF is never published across filesystems");
+	free(bad_chat);
+	free(bad_encoded);
+	bytes = readfile(encoded, MAX_ASSET, &n);
+	text = (char *)unbase64(gif, &i);
+	expect(n == i && !memcmp(bytes, text, n),
+	       "cache hit and invalid GIF preserve encoded bytes");
+	free(bytes);
+	free(text);
+	entries = 0;
+	check(SDL_EnumerateDirectory(cache, count_entry, &entries),
+	      "count cross-filesystem cache entries");
+	expect(entries == 1,
+	       "cache publication cleans its owned staging directory");
+	entries = 0;
+	check(SDL_EnumerateDirectory(cross_fixture, count_entry, &entries),
+	      "count cross-filesystem output entries");
+	expect(entries == 2,
+	       "render cleans output-owned verification scratch");
+	samebytes(chat, saved_chat);
+	samebytes(source, original);
+	free(dir);
+	free(chat);
+	free(saved_chat);
+	free(output);
+	free(saved_output);
+	free(cache);
+	free(encoded);
+	end_cross_fixture();
+}
+
 static void
 cli_tests(const char *bullet, const char *tool)
 {
@@ -1187,6 +1484,7 @@ cli_tests(const char *bullet, const char *tool)
 		 "libx264", "-g", "12", "-preset", "ultrafast", "-c:a", "aac",
 		 "-movflags", "+faststart", source, NULL);
 	copyfile(source, original);
+	cross_cache_tests(bullet, source, original, test_font);
 	run_case(1, bullet, "--help", NULL);
 	text = capture(version);
 	expect(!strcmp(text, "bullet 0.1.0\n") ||
